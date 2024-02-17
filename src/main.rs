@@ -1,13 +1,12 @@
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     execute,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor, SetAttribute, Attribute},
     terminal::{self, ClearType, disable_raw_mode, enable_raw_mode, size},
     cursor::{self, MoveTo},
 };
 use std::io::{self, Write, stdout};
 use std::io::Result;
-
 use std::env;
 use std::fs;
 
@@ -41,65 +40,6 @@ impl Editor {
         }
     }
 
-    // fn draw(&self, stdout: &mut io::Stdout) -> Result<()> {
-    //     let (width, height) = size()?;
-        
-    //     // Apply the theme's overall background color first
-    //     let background_color = hex_to_rgb(&self.theme.background_color).unwrap_or(Color::Rgb { r: 33, g: 33, b: 33 });
-    //     execute!(
-    //         stdout,
-    //         SetBackgroundColor(background_color),
-    //         terminal::Clear(ClearType::All)
-    //     )?;
-
-
-    //     // Calculate the start column based on fringe and line numbers visibility
-    //     let start_col = if self.show_fringe || self.show_line_numbers { 4 } else { 0 }; // Assuming 3 characters wide for line numbers, adjust as needed
-
-    //     // Draw the fringe and line numbers before the main text area
-    //     self.draw_fringe(stdout, height)?;
-    //     self.draw_line_numbers(stdout, height)?;
-        
-    //     // Drawing text area
-    //     for (idx, line) in self.buffer.iter().enumerate() {
-    //         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - 2) as usize {
-    //             let line_content: String = line.iter().collect();
-    //             execute!(
-    //                 stdout,
-    //                 MoveTo(0, (idx - self.offset.1 as usize) as u16),
-    //                 Print(line_content)
-    //             )?;
-    //         }
-    //     }
-
-    //     self.draw_modeline(stdout, width, height)?;
-    //     self.draw_minibuffer(stdout, width, height)?;
-        
-    //     // Reset colors
-    //     execute!(
-    //         stdout,
-    //         ResetColor
-    //     )?;
-
-    //     // Correcting cursor position and ensuring it's visible
-    //     let cursor_pos_within_text_area = (
-    //         self.cursor_pos.0.saturating_sub(self.offset.0),
-    //         self.cursor_pos.1.saturating_sub(self.offset.1)
-    //     );
-
-    //     if cursor_pos_within_text_area.1 < height - 2 {
-    //         // Ensure cursor is shown within the text area
-    //         execute!(
-    //             stdout,
-    //             cursor::MoveTo(cursor_pos_within_text_area.0, cursor_pos_within_text_area.1),
-    //             cursor::Show
-    //         )?;
-    //     }
-
-    //     io::stdout().flush()?;
-    //     Ok(())
-    // }
-
     fn draw(&self, stdout: &mut io::Stdout) -> Result<()> {
         let (width, height) = size()?;
 
@@ -116,7 +56,7 @@ impl Editor {
         // Draw the fringe if enabled
         if self.show_fringe {
             self.draw_fringe(stdout, height)?;
-            start_col += 1; // Fringe takes 1 column
+            start_col += 2; // Fringe takes 1 column
         }
 
         // Draw the line numbers if enabled
@@ -124,6 +64,13 @@ impl Editor {
             self.draw_line_numbers(stdout, height, start_col)?;
             start_col += 4; // Assuming 3 characters for line numbers + 1 space padding
         }
+
+        // Set the text color for the main text area
+        let text_color = hex_to_rgb(&self.theme.text_color).unwrap_or(Color::Rgb { r: 153, g: 149, b: 191 });
+        execute!(
+            stdout,
+            SetForegroundColor(text_color)
+        )?;
 
         // Drawing text area with adjusted starting column
         for (idx, line) in self.buffer.iter().enumerate() {
@@ -141,7 +88,7 @@ impl Editor {
         self.draw_modeline(stdout, width, height)?;
         self.draw_minibuffer(stdout, width, height)?;
 
-        // Reset colors
+        // Reset colors to default after drawing text
         execute!(stdout, ResetColor)?;
 
         // Correcting cursor position and ensuring it's visible
@@ -161,36 +108,30 @@ impl Editor {
         io::stdout().flush()?;
         Ok(())
     }
-
-    
-
-    // fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
-    //     if self.show_line_numbers {
-    //         let line_numbers_color = hex_to_rgb(&self.theme.line_numbers_color).unwrap_or(Color::Grey);
-    //         for y in 0..height - 2 {
-    //             execute!(
-    //                 stdout,
-    //                 MoveTo(start_col, y),
-    //                 SetForegroundColor(line_numbers_color),
-    //                 Print(format!("{:<3}", y + 1 + self.offset.1 as usize)) // Adjust formatting as needed
-    //             )?;
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
+    // TODO ~ after the last line 3 options only one, none or untile the end
     fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
         if self.show_line_numbers {
-            let line_numbers_color = hex_to_rgb(&self.theme.line_numbers_color).unwrap_or(Color::Grey);
-            for y in 0..height - 2 {
-                // Convert `y` to usize for arithmetic operation with other usize values
-                let line_number = (y as usize) + 1 + self.offset.1 as usize;
-                execute!(
-                    stdout,
-                    MoveTo(start_col, y),
-                    SetForegroundColor(line_numbers_color),
-                    Print(format!("{:<3}", line_number)) // Now `line_number` is usize, and formatting it directly
-                )?;
+            for y in 0..height - 2 { // Excluding modeline and minibuffer
+                let line_index = (self.offset.1 as usize) + y as usize; // Calculate line index considering offset
+                if line_index < self.buffer.len() { // Check if line exists
+                    let absolute_line_number = line_index + 1; // Absolute line number
+                    
+                    // Determine the color for the line number
+                    let line_number_color = if self.mode == Mode::Normal && line_index == self.cursor_pos.1 as usize {
+                        hex_to_rgb(&self.theme.current_line_number_color).unwrap_or(Color::Grey)
+                    } else if self.mode == Mode::Insert && line_index == self.cursor_pos.1 as usize {
+                        hex_to_rgb(&self.theme.insert_cursor_color).unwrap_or(Color::Grey)
+                    } else {
+                        hex_to_rgb(&self.theme.line_numbers_color).unwrap_or(Color::Grey)
+                    };
+
+                    execute!(
+                        stdout,
+                        MoveTo(start_col, y),
+                        SetForegroundColor(line_number_color),
+                        Print(format!("{:>3} ", absolute_line_number)) // Right-align with 3 spaces and add 1 space padding
+                    )?;
+                }
             }
         }
         Ok(())
@@ -206,27 +147,61 @@ impl Editor {
                     stdout,
                     MoveTo(0, y),
                     SetForegroundColor(fringe_color),
-                    Print("|") // Or any other symbol you prefer for the fringe
+                    Print("||") // Wider fringe
                 )?;
             }
         }
         Ok(())
     }
 
+
     fn draw_modeline(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
-        let modeline_bg = hex_to_rgb(&self.theme.modeline_color).unwrap_or(Color::DarkGrey);
-        let modeline_fg = hex_to_rgb(&self.theme.modeline_accent_color).unwrap_or(Color::White);
-        execute!(
-            stdout,
-            SetBackgroundColor(modeline_bg),
-            SetForegroundColor(modeline_fg),
-            MoveTo(0, height - 2),
-            Print(" ".repeat(width as usize)), // Fill modeline background
-            MoveTo(0, height - 2),
-            Print("Modeline content here") // Placeholder for actual content
-        )?;
+        let sep = ""; // Separator symbol
+        let file = "main.rs"; // Hardcoded file name for demonstration
+
+        // Determine mode string, mode background color, and text color
+        let (mode_str, mode_bg_color, mode_text_color) = match self.mode {
+            Mode::Normal => (
+                "NORMAL", 
+                self.theme.normal_cursor_color.clone(), 
+                Color::Black,
+            ),
+            Mode::Insert => (
+                "INSERT", 
+                self.theme.insert_cursor_color.clone(), 
+                Color::Black,
+            ),
+        };
+
+        let mode_bg_color = hex_to_rgb(&mode_bg_color).unwrap();
+        let file_bg_color = hex_to_rgb(&self.theme.modeline_lighter_color).unwrap(); // Background color for the file section
+        let file_text_color = hex_to_rgb(&self.theme.text_color).unwrap(); // Text color for the file name
+        let modeline_bg_color = hex_to_rgb(&self.theme.modeline_color).unwrap(); // Background color for the modeline
+
+        // Mode section
+        execute!(stdout, SetBackgroundColor(mode_bg_color), MoveTo(0, height - 2), Print(" "))?;
+        execute!(stdout, SetForegroundColor(mode_text_color), SetAttribute(Attribute::Bold), Print(format!(" {} ", mode_str.to_uppercase())), SetAttribute(Attribute::Reset))?;
+
+        // First separator - now using the background color of line numbers
+        execute!(stdout, SetBackgroundColor(file_bg_color), SetForegroundColor(mode_bg_color), Print(sep))?;
+
+        // File name section
+        execute!(stdout, SetBackgroundColor(file_bg_color), Print(" "))?;
+        execute!(stdout, SetForegroundColor(file_text_color), Print(format!(" {} ", file)))?;
+
+        // Second separator - now using the background color of the modeline
+        execute!(stdout, SetBackgroundColor(modeline_bg_color), SetForegroundColor(file_bg_color), Print(sep))?;
+
+        // Fill the rest of the modeline with the modeline background color
+        let fill_length = width.saturating_sub(4 + mode_str.len() as u16 + file.len() as u16 + 4);
+        execute!(stdout, SetBackgroundColor(modeline_bg_color), Print(" ".repeat(fill_length as usize)))?;
+
+        // Reset styles to default
+        execute!(stdout, ResetColor)?;
         Ok(())
     }
+
+ 
 
     fn draw_minibuffer(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
         let minibuffer_bg = hex_to_rgb(&self.theme.minibuffer_color).unwrap_or(Color::Grey);
@@ -360,10 +335,12 @@ struct Theme {
     insert_cursor_color: String,
     background_color: String,
     modeline_color: String,
-    modeline_accent_color: String,
+    modeline_lighter_color: String,
     minibuffer_color: String,
     fringe_color: String,
     line_numbers_color: String,
+    current_line_number_color: String,
+    text_color: String,
 }
 
 impl Theme {
@@ -374,9 +351,11 @@ impl Theme {
             background_color: "#090909".into(),
             fringe_color: "#090909".into(),
             modeline_color: "#060606".into(),
-            modeline_accent_color: "#658B5F".into(),
-            line_numbers_color: "#658B5F".into(),
+            line_numbers_color: "#171717".into(),
+            modeline_lighter_color: "#171717".into(),
             minibuffer_color: "#070707".into(),
+            text_color: "#9995BF".into(),
+            current_line_number_color: "#C0ACD1".into(),
         }
     }
 
