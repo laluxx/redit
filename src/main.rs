@@ -10,6 +10,11 @@ use std::io::{self, Stdout, Write, stdout};
 use std::io::Result;
 use std::env;
 use std::fs;
+use std::path::Path;
+
+use std::fs::DirEntry;
+use std::path::PathBuf;
+use chrono::{DateTime, Local};
 
 
 #[derive(PartialEq)]
@@ -19,34 +24,28 @@ enum Mode {
     Dired,
 }
 
-use std::fs::DirEntry;
-use std::path::PathBuf;
-
-use chrono::{DateTime, Local};
-
-
-pub struct Dired {
+struct Dired {
     current_path: PathBuf,
     entries: Vec<DirEntry>,
     cursor_pos: u16,
     entry_first_char_column: u16,
+    color_dired: bool,
 }
 
 impl Dired {
 
     fn new(current_path: PathBuf) -> io::Result<Self> {
         let entries = Dired::list_directory_contents(&current_path)?;
-        let cursor_pos = if entries.len() > 2 { 2 } else { 0 }; // Skip '.' and '..'
+        let cursor_pos = if entries.len() == 0 { 0 } else { 2 }; // Skip '.' and '..'
         Ok(Dired {
             current_path,
             entries,
             cursor_pos,
             entry_first_char_column: 0,
+            color_dired: true,
         })
     }
 
-
-    // Lists the contents of the specified directory
     fn list_directory_contents(path: &PathBuf) -> io::Result<Vec<DirEntry>> {
         let mut entries = Vec::new();
         for entry in fs::read_dir(path)? {
@@ -55,20 +54,32 @@ impl Dired {
         }
         Ok(entries)
     }
-    
-    pub fn draw_dired(&mut self, stdout: &mut Stdout, height: u16) -> io::Result<()> {
+
+    fn refresh_directory_contents(&mut self) -> io::Result<()> {
+        self.entries = Dired::list_directory_contents(&self.current_path)?;
+        Ok(())
+    }
+
+
+    // TODO color file extentions if color_dired is true, fix background
+    pub fn draw_dired(&mut self, stdout: &mut Stdout, height: u16, theme: &Theme) -> io::Result<()> {
+        // Display the path at the top with `dired_path_color`
         let display_path = self.current_path.display().to_string();
         let trimmed_path = display_path.trim_end_matches('/');
         execute!(
             stdout,
-            MoveTo(6, 0),
-            Print(format!("{}:", trimmed_path))
+            MoveTo(3, 0),
+            SetForegroundColor(theme.dired_path_color),
+            Print(format!("{}:", trimmed_path)),
+            ResetColor
         )?;
 
         let mut line_number = 2u16;
 
-        let mut entries: Vec<String> = vec![".".into(), "..".into()];
-        entries.extend(self.entries.iter().map(|e| e.file_name().to_str().unwrap_or("").to_string()));
+        let entries = vec![".".into(), "..".into()]
+            .into_iter()
+            .chain(self.entries.iter().map(|e| e.file_name().to_str().unwrap_or("").to_string()))
+            .collect::<Vec<String>>();
 
         // Determine the maximum length of file size
         let max_size_length = entries.iter()
@@ -79,27 +90,78 @@ impl Dired {
             .max()
             .unwrap_or(0);
 
-        self.entry_first_char_column = 37 + max_size_length as u16;
+        self.entry_first_char_column = 35 + max_size_length as u16;
 
         for entry_name in &entries {
             if line_number >= height - 1 { break; }
 
             let path = self.current_path.join(entry_name);
             let metadata = fs::metadata(&path)?;
-            let file_type = if metadata.is_dir() { "d" } else { "-" };
+            let is_dir = metadata.is_dir();
+            let file_type_char = if is_dir { "d" } else { "-" };
             let permissions = "rwxr-xr-x";
             let size = metadata.len();
             let modified: DateTime<Local> = DateTime::from(metadata.modified()?);
             let owner = "l l";
-
-            // Use the max size length to adjust padding dynamically
             let size_str = format!("{:1$}", size, max_size_length);
-            let file_info = format!("{:3}{}{} {:<3} {} {:14} {}", "", file_type, permissions, owner, size_str, modified.format("%b %d %H:%M"), entry_name);
+
+            let entry_color = if entry_name == "." || entry_name == ".." || is_dir {
+                if self.color_dired {
+                    theme.normal_cursor_color
+                } else {
+                    theme.dired_dir_color
+                }
+            } else {
+                theme.text_color
+            };
+
+            execute!(stdout, MoveTo(3, line_number))?;
+
+            if self.color_dired {
+                execute!(
+                    stdout,
+                    SetForegroundColor(entry_color),
+                    Print(file_type_char),
+                    ResetColor
+                )?;
+            } else {
+                execute!(
+                    stdout,
+                    SetForegroundColor(theme.text_color),
+                    Print(file_type_char),
+                    ResetColor
+                )?;
+            }
+
+            if self.color_dired {
+                for ch in permissions.chars() {
+                    let color = match ch {
+                        'r' => theme.warning_color,
+                        'w' => theme.error_color,
+                        'x' => theme.ok_color,
+                        '-' => theme.comment_color,
+                        _ => theme.text_color, // Default color
+                    };
+                    execute!(stdout, SetForegroundColor(color), Print(ch))?;
+                }
+            } else {
+                execute!(
+                    stdout,
+                    SetForegroundColor(theme.text_color),
+                    Print(permissions),
+                    ResetColor
+                )?;
+            }
 
             execute!(
                 stdout,
-                MoveTo(3, line_number),
-                Print(file_info)
+                ResetColor,
+                Print(" "),
+                SetForegroundColor(theme.text_color), Print(format!("{:<3} ", owner)),
+                SetForegroundColor(if self.color_dired { theme.dired_size_color } else { theme.text_color }), Print(format!("{} ", size_str)),
+                SetForegroundColor(if self.color_dired { theme.dired_timestamp_color } else { theme.text_color }), Print(format!("{:14} ", modified.format("%b %d %H:%M"))),
+                SetForegroundColor(entry_color), Print(format!(" {}", entry_name)),
+                ResetColor
             )?;
 
             line_number += 1;
@@ -118,6 +180,10 @@ struct Editor {
     theme: Theme,
     show_fringe: bool,
     show_line_numbers: bool,
+    insert_line_cursor: bool,
+    minibuffer_active: bool,
+    minibuffer_content: String,
+    minibuffer_prefix: String,
 }
 
 impl Editor {
@@ -130,87 +196,88 @@ impl Editor {
             theme: Theme::new(),
             show_fringe: true,
             show_line_numbers: true,
+            insert_line_cursor: false,
             dired: None,
+            minibuffer_active: false,
+            minibuffer_content: String::new(),
+            minibuffer_prefix: String::new(),
         }
     }
 
     fn draw(&mut self, stdout: &mut Stdout) -> Result<()> {
         let (width, height) = terminal::size()?;
-        let background_color = hex_to_rgb(&self.theme.background_color).unwrap();
+        let background_color = self.theme.background_color;
+
         execute!(
             stdout,
             SetBackgroundColor(background_color),
             terminal::Clear(ClearType::All)
         )?;
 
-        // In Dired mode, only draw the directory listing
+        // Always draw modeline and minibuffer
+        self.draw_modeline(stdout, width, height)?;
+        self.draw_minibuffer(stdout, width, height)?;
+
         if self.mode == Mode::Dired {
-
-            self.draw_modeline(stdout, width, height)?;
-            self.draw_minibuffer(stdout, width, height)?;
-            
-            execute!(stdout, ResetColor)?;
-
-            execute!(
-                stdout,
-                SetBackgroundColor(background_color),
-                // terminal::Clear(ClearType::All)
-            )?;
-            
             if let Some(ref mut dired) = &mut self.dired {
-                dired.draw_dired(stdout, height)?;
-
-                let cursor_line = dired.cursor_pos + 2; // Skip '.' and '..'
-                execute!(
-                    stdout,
-                    cursor::MoveTo(dired.entry_first_char_column, cursor_line), // Move cursor to the first character of the entry
-                    // cursor::Show
-                )?;
-
-            }
-
-        } else {
-            let mut start_col = 0;
-
-            // Fringe
-            if self.show_fringe {
-                self.draw_fringe(stdout, height)?;
-                start_col += 2; // Fringe takes 1 column
-            }
-
-            // Line numbers
-            if self.show_line_numbers {
-                self.draw_line_numbers(stdout, height, start_col)?;
-                start_col += 4; // Assuming 3 characters for line numbers + 1 space padding
-            }
-
-            self.draw_text(stdout)?;
-            self.draw_modeline(stdout, width, height)?;
-            self.draw_minibuffer(stdout, width, height)?;
-            execute!(stdout, ResetColor)?;
-
-            // Cursor
-            let cursor_pos_within_text_area = (
-                self.cursor_pos.0.saturating_sub(self.offset.0) + start_col, // Adjust cursor X position by start_col
-                self.cursor_pos.1.saturating_sub(self.offset.1)
-            );
-
-            if cursor_pos_within_text_area.1 < height - 2 {
-                execute!(
-                    stdout,
-                    cursor::MoveTo(cursor_pos_within_text_area.0, cursor_pos_within_text_area.1),
-                    cursor::Show
-                )?;
+                dired.draw_dired(stdout, height, &self.theme)?;
             }
         }
+
+        // Reset the background color for fringe and line numbers
+        execute!(stdout, SetBackgroundColor(background_color))?;
+
+        // Draw text area for non-Dired modes
+        if self.mode != Mode::Dired {
+            let mut start_col = 0;
+            if self.show_fringe {
+                // Ensure the background color is correct for the fringe
+                self.draw_fringe(stdout, height)?;
+                start_col += 2;
+            }
+            if self.show_line_numbers {
+                // Ensure the background color is correct for the line numbers
+                self.draw_line_numbers(stdout, height, start_col)?;
+            }
+            self.draw_text(stdout)?;
+        }
+
+        // Calculate and set the cursor position
+        let cursor_pos = if self.minibuffer_active {
+            let minibuffer_cursor_pos_x = 2 + self.minibuffer_prefix.len() as u16 + self.minibuffer_content.len() as u16;
+            (minibuffer_cursor_pos_x, height - 1) // Adjust for minibuffer's position at the bottom
+        } else if self.mode == Mode::Dired {
+            self.dired.as_ref().map_or((0, 0), |dired| {
+                let cursor_line = dired.cursor_pos + 2; // Skip '.' and '..'
+                (dired.entry_first_char_column, cursor_line)
+            })
+        } else {
+            let mut start_col = 0;
+            if self.show_fringe {
+                start_col += 2; // Account for fringe column
+            }
+            if self.show_line_numbers {
+                start_col += 4; // Account for line number columns
+            }
+            let cursor_x = self.cursor_pos.0.saturating_sub(self.offset.0) + start_col;
+            let cursor_y = self.cursor_pos.1.saturating_sub(self.offset.1);
+            (cursor_x, cursor_y)
+        };
+
+        // Position the cursor
+        execute!(
+            stdout,
+            cursor::MoveTo(cursor_pos.0, cursor_pos.1),
+            cursor::Show
+        )?;
 
         io::stdout().flush()?;
         Ok(())
     }
-
+    
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
         let (width, height) = size()?; // TODO horizontal scrolling
-        let text_color = hex_to_rgb(&self.theme.text_color).unwrap();
+        let text_color = self.theme.text_color;
         let mut start_col = 0;
 
         if self.show_fringe {
@@ -251,11 +318,11 @@ impl Editor {
                     
                     // Determine the color for the line number
                     let line_number_color = if self.mode == Mode::Normal && line_index == self.cursor_pos.1 as usize {
-                        hex_to_rgb(&self.theme.current_line_number_color).unwrap()
+                        self.theme.current_line_number_color
                     } else if self.mode == Mode::Insert && line_index == self.cursor_pos.1 as usize {
-                        hex_to_rgb(&self.theme.insert_cursor_color).unwrap()
+                        self.theme.insert_cursor_color
                     } else {
-                        hex_to_rgb(&self.theme.line_numbers_color).unwrap()
+                        self.theme.line_numbers_color
                     };
 
                     execute!(
@@ -272,7 +339,7 @@ impl Editor {
     
     fn draw_fringe(&self, stdout: &mut io::Stdout, height: u16) -> Result<()> {
         if self.show_fringe {
-            let fringe_color = hex_to_rgb(&self.theme.fringe_color).unwrap_or(Color::Grey);
+            let fringe_color = self.theme.fringe_color;
             for y in 0..height - 2 { // Exclude modeline and minibuffer
                 execute!(
                     stdout,
@@ -290,29 +357,28 @@ impl Editor {
         let sep_l = "";
         let file = "main.rs"; // TODO hardcoded
 
-        // Determine mode string, mode background color, and text color
         let (mode_str, mode_bg_color, mode_text_color) = match self.mode {
             Mode::Normal => (
                 "NORMAL", 
-                self.theme.normal_cursor_color.clone(), 
+                self.theme.normal_cursor_color, 
                 Color::Black,
             ),
             Mode::Insert => (
                 "INSERT", 
-                self.theme.insert_cursor_color.clone(), 
+                self.theme.insert_cursor_color, 
                 Color::Black,
             ),
             Mode::Dired => (
                 "DIRED", 
-                self.theme.dired_mode_color.clone(), 
+                self.theme.dired_mode_color, 
                 Color::Black,
             ),
         };
 
-        let mode_bg_color = hex_to_rgb(&mode_bg_color).unwrap();
-        let file_bg_color = hex_to_rgb(&self.theme.modeline_lighter_color).unwrap();
-        let file_text_color = hex_to_rgb(&self.theme.text_color).unwrap();
-        let modeline_bg_color = hex_to_rgb(&self.theme.modeline_color).unwrap();
+        let mode_bg_color = mode_bg_color;
+        let file_bg_color = self.theme.modeline_lighter_color;
+        let file_text_color = self.theme.text_color;
+        let modeline_bg_color = self.theme.modeline_color;
 
         // Mode section
         execute!(stdout, SetBackgroundColor(mode_bg_color), MoveTo(0, height - 2), Print(" "))?;
@@ -339,7 +405,7 @@ impl Editor {
         execute!(stdout, SetBackgroundColor(modeline_bg_color), Print(" ".repeat(fill_length_before_pos_str as usize)))?;
 
         // Separator before position section, with modeline color as text color and normal cursor color as background
-        let normal_cursor_color = hex_to_rgb(&self.theme.normal_cursor_color).unwrap();
+        let normal_cursor_color = self.theme.normal_cursor_color;
         execute!(stdout, SetBackgroundColor(modeline_bg_color), SetForegroundColor(normal_cursor_color), Print(sep_l))?;
 
         // Adding a small padding from the right of the screen
@@ -355,16 +421,21 @@ impl Editor {
     }
 
     fn draw_minibuffer(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
-        let minibuffer_bg = hex_to_rgb(&self.theme.minibuffer_color).unwrap_or(Color::Grey);
+        let minibuffer_bg = self.theme.minibuffer_color;
+        let content_fg = self.theme.text_color;
+        let prefix_fg = self.theme.normal_cursor_color;
         execute!(
             stdout,
             SetBackgroundColor(minibuffer_bg),
-            SetForegroundColor(Color::Yellow),
+            SetForegroundColor(prefix_fg),
             MoveTo(0, height - 1),
             Print(" ".repeat(width as usize)), // Fill minibuffer background
             MoveTo(0, height - 1),
-            Print("Minibuffer content here") // Placeholder for actual content
+            Print(format!(" {}", self.minibuffer_prefix)),
+            SetForegroundColor(content_fg),
+            Print(format!(" {}", self.minibuffer_content))
         )?;
+
         Ok(())
     }
 
@@ -389,10 +460,39 @@ impl Editor {
             self.draw(&mut stdout)?;
 
             if let Event::Key(key) = event::read()? {
-                match self.mode {
-                    Mode::Normal => self.handle_normal_mode(key)?,
-                    Mode::Insert => self.handle_insert_mode(key)?,
-                    Mode::Dired => self.handle_dired_mode(key)?,
+                if self.minibuffer_active {
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            self.minibuffer_content.push(c);
+                        },
+                        KeyCode::Backspace => {
+                            self.minibuffer_content.pop();
+                        },
+                        KeyCode::Enter => {
+                            if self.mode == Mode::Dired {
+                                let file_path = self.dired.as_ref().unwrap().current_path.join(&self.minibuffer_content);
+                                // std::fs::File::create(file_path)?;
+
+                                if std::fs::File::create(file_path).is_ok() {
+                                    // If file creation was successful, refresh the directory listing
+                                    if let Some(dired) = &mut self.dired {
+                                        dired.refresh_directory_contents()?;
+                                    }
+                                }
+
+                                self.minibuffer_active = false;
+                                self.minibuffer_prefix.clear();
+                                self.minibuffer_content.clear();
+                            }
+                        },
+                        _ => {}
+                    }
+                } else {
+                    match self.mode {
+                        Mode::Normal => self.handle_normal_mode(key)?,
+                        Mode::Insert => self.handle_insert_mode(key)?,
+                        Mode::Dired => self.handle_dired_mode(key)?,
+                    }
                 }
             }
         }
@@ -402,7 +502,13 @@ impl Editor {
         let shape_code = match self.mode {
             Mode::Normal => "\x1b[2 q", // Block
             Mode::Dired => "\x1b[2 q", // Block
-            Mode::Insert => "\x1b[6 q", // Line
+            Mode::Insert => {
+                if self.insert_line_cursor {
+                    "\x1b[6 q" // Line
+                } else {
+                    "\x1b[2 q" // Block
+                }
+            }
         };
         print!("{}", shape_code);
         io::stdout().flush().unwrap();
@@ -425,6 +531,41 @@ impl Editor {
                     }
                 }
             },
+            KeyCode::Char('h') => {
+                // Navigate to the parent directory
+                if let Some(dired) = &mut self.dired {
+                    let parent_path = dired.current_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+                    *dired = Dired::new(parent_path)?;
+                }
+            },
+            KeyCode::Char('l') => {
+                if let Some(dired) = &mut self.dired {
+                    if dired.cursor_pos == 0 {
+                        // Do nothing for '.'
+                    } else if dired.cursor_pos == 1 {
+                        // Handle '..' the same as 'h', navigate to the parent directory
+                        let parent_path = dired.current_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+                        *dired = Dired::new(parent_path)?;
+                    } else {
+                        let selected_entry = &dired.entries[dired.cursor_pos as usize - 2]; // Adjusting for '.' and '..'
+                        let path = selected_entry.path();
+                        if path.is_dir() {
+                            *dired = Dired::new(path.to_path_buf())?;
+                        } else if path.is_file() {
+                            self.open(&path.to_string_lossy())?;
+                            self.mode = Mode::Normal; // Or a different mode meant for editing/viewing files
+                        }
+                    }
+                }
+            },
+
+            // TODO ('T') should touch and open the file
+            KeyCode::Char('t') => {
+                self.minibuffer_active = true;
+                self.minibuffer_prefix = "Touch:".to_string();
+                self.minibuffer_content = "".to_string();
+            },
+
             KeyCode::Char('q') => {
                 self.mode = Mode::Normal;
             },
@@ -515,39 +656,54 @@ impl Editor {
 
 
 struct Theme {
-    normal_cursor_color: String,
-    insert_cursor_color: String,
-    background_color: String,
-    modeline_color: String,
-    modeline_lighter_color: String,
-    minibuffer_color: String,
-    fringe_color: String,
-    line_numbers_color: String,
-    current_line_number_color: String,
-    text_color: String,
-    dired_mode_color: String,
+    background_color: Color,
+    text_color: Color,
+    normal_cursor_color: Color,
+    insert_cursor_color: Color,
+    fringe_color: Color,
+    line_numbers_color: Color,
+    current_line_number_color: Color,
+    modeline_color: Color,
+    modeline_lighter_color: Color,
+    minibuffer_color: Color,
+    dired_mode_color: Color,
+    dired_timestamp_color: Color,
+    dired_path_color: Color,
+    dired_size_color: Color,
+    dired_dir_color: Color,
+    comment_color: Color,
+    warning_color: Color,
+    error_color: Color,
+    ok_color: Color,
+
 }
 
 impl Theme {
     fn new() -> Self {
         Theme {
-            normal_cursor_color: "#658B5F".into(),
-            insert_cursor_color: "#514B8E".into(),
-            dired_mode_color: "#565663".into(),
-            background_color: "#090909".into(),
-            fringe_color: "#090909".into(),
-            modeline_color: "#060606".into(),
-            line_numbers_color: "#171717".into(),
-            modeline_lighter_color: "#171717".into(),
-            minibuffer_color: "#070707".into(),
-            text_color: "#9995BF".into(),
-            current_line_number_color: "#C0ACD1".into(),
+            background_color: hex_to_rgb("#090909").unwrap(),
+            text_color: hex_to_rgb("#9995BF").unwrap(),
+            normal_cursor_color: hex_to_rgb("#658B5F").unwrap(),
+            insert_cursor_color: hex_to_rgb("#514B8E").unwrap(),
+            fringe_color: hex_to_rgb("#090909").unwrap(),
+            line_numbers_color: hex_to_rgb("#171717").unwrap(),
+            current_line_number_color: hex_to_rgb("#C0ACD1").unwrap(),
+            modeline_color: hex_to_rgb("#060606").unwrap(),
+            modeline_lighter_color: hex_to_rgb("#171717").unwrap(),
+            minibuffer_color: hex_to_rgb("#070707").unwrap(),
+            dired_mode_color: hex_to_rgb("#565663").unwrap(),
+            dired_timestamp_color: hex_to_rgb("#514B8E").unwrap(),
+            dired_path_color: hex_to_rgb("#658B5F").unwrap(),
+            dired_size_color: hex_to_rgb("#48534A").unwrap(),
+            dired_dir_color: hex_to_rgb("#514B8E").unwrap(),
+            comment_color: hex_to_rgb("#867892").unwrap(),
+            warning_color: hex_to_rgb("#565663").unwrap(),
+            error_color: hex_to_rgb("#444E46").unwrap(),
+            ok_color: hex_to_rgb("#4C6750").unwrap(),
         }
     }
-
-
+    
     fn apply_cursor_color(&self, cursor_pos: (u16, u16), buffer: &Vec<Vec<char>>, mode: &Mode) {
-        // Determine if the cursor is over a non-space character in Normal mode
         let is_over_text = if let Mode::Normal = mode {
             buffer.get(cursor_pos.1 as usize)
                 .and_then(|line| line.get(cursor_pos.0 as usize))
@@ -557,15 +713,9 @@ impl Theme {
             false
         };
 
-        // Choose the color based on whether the cursor is over text
         let color = if is_over_text {
-            // Use the text cursor color if over text
             &self.text_color
-            // "\x1b[37m" // ANSI escape code for white foreground
-                
-                
         } else {
-            // Use the mode-specific cursor color otherwise
             match mode {
                 Mode::Normal => &self.normal_cursor_color,
                 Mode::Insert => &self.insert_cursor_color,
@@ -573,8 +723,16 @@ impl Theme {
             }
         };
 
-        // Print the ANSI escape code to set the cursor color
-        print!("\x1b]12;{}\x1b\\", color);
+        // Convert the Color::Rgb to an ANSI escape sequence
+        match color {
+            Color::Rgb { r, g, b } => {
+                // Construct the ANSI escape code for RGB color setting
+                let ansi_color = format!("\x1b]12;rgb:{:02x}/{:02x}/{:02x}\x1b\\", r, g, b);
+                print!("{}", ansi_color);
+            },
+            _ => {} // Handle other color types
+        }
+
         io::stdout().flush().unwrap();
     }
 }
