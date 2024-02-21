@@ -93,7 +93,6 @@ impl Dired {
         Ok(())
     }
 
-
     pub fn rename_entry(&mut self, new_name: &str) -> io::Result<()> {
         // Check if the cursor position is valid for renaming (skipping '.' and '..')
         if self.cursor_pos > 1 && (self.cursor_pos as usize - 2) < self.entries.len() {
@@ -114,6 +113,7 @@ impl Dired {
     }
 
     // TODO color file extentions if color_dired is true, fix background
+    // TODO scrolling, it overlap the modeline..
     pub fn draw_dired(&mut self, stdout: &mut Stdout, height: u16, theme: &Theme) -> io::Result<()> {
         // Display the path at the top with `dired_path_color`
         let display_path = self.current_path.display().to_string();
@@ -280,7 +280,6 @@ impl Editor {
         }
     }
 
-
     pub fn buffer_save(&self) -> Result<()> {
         let content: String = self.buffer.iter()
             .map(|line| line.iter().collect::<String>())
@@ -292,6 +291,13 @@ impl Editor {
         
         println!("File saved successfully.");
         Ok(())
+    }
+
+    fn enter(&mut self) {
+        let tail = self.buffer[self.cursor_pos.1 as usize].split_off(self.cursor_pos.0 as usize);
+        self.buffer.insert(self.cursor_pos.1 as usize + 1, tail);
+        self.cursor_pos.1 += 1;
+        self.cursor_pos.0 = 0;
     }
 
 
@@ -570,7 +576,7 @@ impl Editor {
                                     dired.create_directory(&minibuffer_content)?;
                                     dired.refresh_directory_contents()?;
                                 }
-                            } else if self.minibuffer_prefix == "Delete [y/n]:" {
+                            } else if self.minibuffer_prefix.starts_with("Delete ") && self.minibuffer_prefix.ends_with(" [y/n]:") {
                                 if minibuffer_content == "y" {
                                     if let Some(dired) = &mut self.dired {
                                         dired.delete_entry()?;
@@ -695,9 +701,16 @@ impl Editor {
             },
 
             KeyCode::Char('D') => {
-                self.minibuffer_active = true;
-                self.minibuffer_prefix = "Delete [y/n]:".to_string();
-                self.minibuffer_content = "".to_string();
+                if let Some(dired) = &self.dired {
+                    if dired.cursor_pos > 1 && (dired.cursor_pos as usize - 2) < dired.entries.len() {
+                        let entry_to_delete = &dired.entries[dired.cursor_pos as usize - 2];
+                        let entry_name = entry_to_delete.file_name().to_string_lossy().into_owned();
+
+                        self.minibuffer_prefix = format!("Delete {} [y/n]:", entry_name);
+                        self.minibuffer_active = true;
+                        self.minibuffer_content = "".to_string();
+                    }
+                }
             },
 
             KeyCode::Char('r') => {
@@ -737,6 +750,15 @@ impl Editor {
                 self.minibuffer_prefix = "Switch theme:".to_string();
                 self.minibuffer_content = "".to_string();
             },
+
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.enter();
+            }
+
             KeyEvent {
                 code,
                 modifiers: KeyModifiers::NONE,
@@ -838,10 +860,7 @@ impl Editor {
                 }
             },
             KeyCode::Enter => {
-                let tail = self.buffer[self.cursor_pos.1 as usize].split_off(self.cursor_pos.0 as usize);
-                self.buffer.insert(self.cursor_pos.1 as usize + 1, tail);
-                self.cursor_pos.1 += 1;
-                self.cursor_pos.0 = 0;
+                self.enter();
             },
             _ => {}
         }
@@ -870,7 +889,6 @@ struct Theme {
     warning_color: Color,
     error_color: Color,
     ok_color: Color,
-
 }
 
 impl Theme {
@@ -922,8 +940,6 @@ impl Theme {
         }
     }
 
-
-    
     fn apply_cursor_color(&self, cursor_pos: (u16, u16), buffer: &Vec<Vec<char>>, mode: &Mode) {
         let is_over_text = if let Mode::Normal = mode {
             buffer.get(cursor_pos.1 as usize)
