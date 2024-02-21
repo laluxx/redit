@@ -1,12 +1,12 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor, SetAttribute, Attribute},
     terminal::{self, ClearType, disable_raw_mode, enable_raw_mode, size},
     cursor::{self, MoveTo},
 };
 
-use std::io::{self, Stdout, Write, stdout};
+use std::{fs::create_dir, io::{self, stdout, Stdout, Write}};
 use std::io::Result;
 use std::env;
 use std::fs;
@@ -15,7 +15,7 @@ use std::path::Path;
 use std::fs::DirEntry;
 use std::path::PathBuf;
 use chrono::{DateTime, Local};
-
+use std::collections::HashMap;
 
 #[derive(PartialEq)]
 enum Mode {
@@ -60,6 +60,58 @@ impl Dired {
         Ok(())
     }
 
+    pub fn create_directory(&mut self, dir_name: &str) -> io::Result<()> {
+        let new_dir_path = self.current_path.join(dir_name);
+        fs::create_dir(&new_dir_path)?;
+        Ok(())
+    }
+
+    pub fn delete_entry(&mut self) -> io::Result<()> {
+        // Ensure its not '.' or '..'
+        if self.cursor_pos > 1 && (self.cursor_pos as usize - 2) < self.entries.len() {
+            let entry_to_delete = &self.entries[self.cursor_pos as usize - 2];
+            let path_to_delete = entry_to_delete.path();
+
+            if path_to_delete.is_dir() {
+                // Recursive
+                fs::remove_dir_all(&path_to_delete)?;
+            } else {
+                fs::remove_file(&path_to_delete)?;
+            }
+
+            self.refresh_directory_contents()?;
+
+            // Check if the deleted entry was the last one
+            if self.cursor_pos as usize - 2 >= self.entries.len() {
+                // If it was the last one, move the cursor up by one position, if possible
+                if self.cursor_pos > 2 { // Ensure it's not the first actual entry ('.' or '..')
+                    self.cursor_pos -= 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+
+    pub fn rename_entry(&mut self, new_name: &str) -> io::Result<()> {
+        // Check if the cursor position is valid for renaming (skipping '.' and '..')
+        if self.cursor_pos > 1 && (self.cursor_pos as usize - 2) < self.entries.len() {
+            let entry_to_rename = &self.entries[self.cursor_pos as usize - 2];
+            let original_path = entry_to_rename.path();
+            let new_path = original_path.parent().unwrap().join(new_name);
+
+            // Perform the rename operation
+            fs::rename(&original_path, &new_path)?;
+
+            // Refresh the directory listing to reflect the changes
+            self.refresh_directory_contents()?;
+        } else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid selection for rename."));
+        }
+
+        Ok(())
+    }
 
     // TODO color file extentions if color_dired is true, fix background
     pub fn draw_dired(&mut self, stdout: &mut Stdout, height: u16, theme: &Theme) -> io::Result<()> {
@@ -177,23 +229,33 @@ struct Editor {
     cursor_pos: (u16, u16),
     offset: (u16, u16),
     buffer: Vec<Vec<char>>,
-    theme: Theme,
+    // theme: Theme,
+    themes: HashMap<String, Theme>,
+    current_theme_name: String,
     show_fringe: bool,
     show_line_numbers: bool,
     insert_line_cursor: bool,
     minibuffer_active: bool,
     minibuffer_content: String,
     minibuffer_prefix: String,
+    current_file_path: PathBuf,
+    should_open_file: bool,
 }
 
 impl Editor {
     fn new() -> Editor {
+        let mut themes = HashMap::new();
+        themes.insert("nature".to_string(), Theme::nature());
+        themes.insert("everforest".to_string(), Theme::everforest_medium());
+        let initial_theme_name = "nature".to_string();
+
         Editor { 
             mode: Mode::Normal, 
             cursor_pos: (0, 0), 
             offset: (0, 0),
-            buffer: vec![vec![]], 
-            theme: Theme::new(),
+            buffer: vec![vec![]],
+            themes,
+            current_theme_name: initial_theme_name,
             show_fringe: true,
             show_line_numbers: true,
             insert_line_cursor: false,
@@ -201,12 +263,41 @@ impl Editor {
             minibuffer_active: false,
             minibuffer_content: String::new(),
             minibuffer_prefix: String::new(),
+            current_file_path: env::current_dir().unwrap(),
+            should_open_file: false,
         }
     }
 
+    fn current_theme(&self) -> &Theme {
+        self.themes.get(&self.current_theme_name).expect("Current theme not found")
+    }
+
+    fn switch_theme(&mut self, theme_name: &str) {
+        if self.themes.contains_key(theme_name) {
+            self.current_theme_name = theme_name.to_string();
+        } else {
+            // TODO implement message() theme doesn't exist 
+        }
+    }
+
+
+    pub fn buffer_save(&self) -> Result<()> {
+        let content: String = self.buffer.iter()
+            .map(|line| line.iter().collect::<String>())
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        fs::write(&self.current_file_path, content)
+            .expect("Failed to save file");
+        
+        println!("File saved successfully.");
+        Ok(())
+    }
+
+
     fn draw(&mut self, stdout: &mut Stdout) -> Result<()> {
         let (width, height) = terminal::size()?;
-        let background_color = self.theme.background_color;
+        let background_color = self.current_theme().background_color;
 
         execute!(
             stdout,
@@ -219,8 +310,10 @@ impl Editor {
         self.draw_minibuffer(stdout, width, height)?;
 
         if self.mode == Mode::Dired {
-            if let Some(ref mut dired) = &mut self.dired {
-                dired.draw_dired(stdout, height, &self.theme)?;
+            if let Some(mut dired) = self.dired.take() { // Temporarily take `dired` out of `self`
+                let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
+                dired.draw_dired(stdout, height, theme)?;
+                self.dired.replace(dired); // Put `dired` back into `self`
             }
         }
 
@@ -277,7 +370,7 @@ impl Editor {
     
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
         let (width, height) = size()?; // TODO horizontal scrolling
-        let text_color = self.theme.text_color;
+        let text_color = self.current_theme().text_color;
         let mut start_col = 0;
 
         if self.show_fringe {
@@ -318,11 +411,11 @@ impl Editor {
                     
                     // Determine the color for the line number
                     let line_number_color = if self.mode == Mode::Normal && line_index == self.cursor_pos.1 as usize {
-                        self.theme.current_line_number_color
+                        self.current_theme().current_line_number_color
                     } else if self.mode == Mode::Insert && line_index == self.cursor_pos.1 as usize {
-                        self.theme.insert_cursor_color
+                        self.current_theme().insert_cursor_color
                     } else {
-                        self.theme.line_numbers_color
+                        self.current_theme().line_numbers_color
                     };
 
                     execute!(
@@ -339,7 +432,7 @@ impl Editor {
     
     fn draw_fringe(&self, stdout: &mut io::Stdout, height: u16) -> Result<()> {
         if self.show_fringe {
-            let fringe_color = self.theme.fringe_color;
+            let fringe_color = self.current_theme().fringe_color;
             for y in 0..height - 2 { // Exclude modeline and minibuffer
                 execute!(
                     stdout,
@@ -355,75 +448,61 @@ impl Editor {
     fn draw_modeline(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
         let sep_r = "";
         let sep_l = "";
-        let file = "main.rs"; // TODO hardcoded
 
-        let (mode_str, mode_bg_color, mode_text_color) = match self.mode {
-            Mode::Normal => (
-                "NORMAL", 
-                self.theme.normal_cursor_color, 
-                Color::Black,
-            ),
-            Mode::Insert => (
-                "INSERT", 
-                self.theme.insert_cursor_color, 
-                Color::Black,
-            ),
-            Mode::Dired => (
-                "DIRED", 
-                self.theme.dired_mode_color, 
-                Color::Black,
-            ),
+        // Determine what to display based on the current mode
+        let display_str = match self.mode {
+            Mode::Dired => {
+                // In Dired mode, use the current directory from the Dired struct
+                if let Some(dired) = &self.dired {
+                    format!("󰉋 {}", dired.current_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("")).to_str().unwrap())
+                } else {
+                    "󰉋 Unknown".to_string()
+                }
+            },
+            // In other modes, display just the file name from `current_file_path`
+            _ => self.current_file_path.file_name().map_or("Untitled".to_string(), |os_str| os_str.to_str().unwrap_or("Untitled").to_string()),
         };
 
-        let mode_bg_color = mode_bg_color;
-        let file_bg_color = self.theme.modeline_lighter_color;
-        let file_text_color = self.theme.text_color;
-        let modeline_bg_color = self.theme.modeline_color;
+        // Mode string, background, and text color setup remains unchanged
+        let (mode_str, mode_bg_color, mode_text_color) = match self.mode {
+            Mode::Normal => ("NORMAL", self.current_theme().normal_cursor_color, Color::Black),
+            Mode::Insert => ("INSERT", self.current_theme().insert_cursor_color, Color::Black),
+            Mode::Dired => ("DIRED", self.current_theme().dired_mode_color, Color::Black),
+        };
 
-        // Mode section
+        let file_bg_color = self.current_theme().modeline_lighter_color;
+        let file_text_color = self.current_theme().text_color;
+        let modeline_bg_color = self.current_theme().modeline_color;
+
+        // Drawing logic begins here
         execute!(stdout, SetBackgroundColor(mode_bg_color), MoveTo(0, height - 2), Print(" "))?;
-        execute!(stdout, SetForegroundColor(mode_text_color), SetAttribute(Attribute::Bold), Print(format!(" {} ", mode_str.to_uppercase())), SetAttribute(Attribute::Reset))?;
-
-        // First separator
+        execute!(stdout, SetForegroundColor(mode_text_color), SetAttribute(Attribute::Bold), Print(format!(" {} ", mode_str)), SetAttribute(Attribute::Reset))?;
         execute!(stdout, SetBackgroundColor(file_bg_color), SetForegroundColor(mode_bg_color), Print(sep_r))?;
-
-        // File name section
         execute!(stdout, SetBackgroundColor(file_bg_color), Print(" "))?;
-        execute!(stdout, SetForegroundColor(file_text_color), Print(format!(" {} ", file)))?;
-
-        // Second separator
+        execute!(stdout, SetForegroundColor(file_text_color), Print(format!(" {} ", display_str)))?;
         execute!(stdout, SetBackgroundColor(modeline_bg_color), SetForegroundColor(file_bg_color), Print(sep_r))?;
 
-        // Determine the position string, adjusting for 0-based index
         let pos_str = format!("{}:{}", self.cursor_pos.1 + 1, self.cursor_pos.0 + 1);
-
-        // Calculate remaining space after drawing the existing sections
         let pos_str_length = pos_str.len() as u16 + 2;
-        let fill_length_before_pos_str = width - (4 + mode_str.len() as u16 + file.len() as u16 + pos_str_length + 3);
 
-        // Fill the space between file section and position section with the modeline background color
+        let fill_length_before_pos_str = if self.mode == Mode::Dired {
+            width - (4 + mode_str.len() as u16 + display_str.len() as u16 + pos_str_length)
+        } else {
+            width - (4 + mode_str.len() as u16 + display_str.len() as u16 + pos_str_length + 3)
+        };
+
         execute!(stdout, SetBackgroundColor(modeline_bg_color), Print(" ".repeat(fill_length_before_pos_str as usize)))?;
-
-        // Separator before position section, with modeline color as text color and normal cursor color as background
-        let normal_cursor_color = self.theme.normal_cursor_color;
-        execute!(stdout, SetBackgroundColor(modeline_bg_color), SetForegroundColor(normal_cursor_color), Print(sep_l))?;
-
-        // Adding a small padding from the right of the screen
-        let right_padding = 11; // Change this value to add more padding if needed
-        let padding_spaces = " ".repeat(right_padding as usize);
-
-        // Position section with normal cursor color as background and black text
-        execute!(stdout, SetBackgroundColor(normal_cursor_color), SetForegroundColor(Color::Black), Print(format!("{}{} ", pos_str, padding_spaces)))?;
-
-        // Reset styles to default
+        execute!(stdout, SetBackgroundColor(modeline_bg_color), SetForegroundColor(self.current_theme().normal_cursor_color), Print(sep_l))?;
+        execute!(stdout, SetBackgroundColor(self.current_theme().normal_cursor_color), SetForegroundColor(Color::Black), Print(format!("{} ", pos_str)))?;
         execute!(stdout, ResetColor)?;
+
         Ok(())
     }
-
+    
     fn draw_minibuffer(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
-        let minibuffer_bg = self.theme.minibuffer_color;
-        let content_fg = self.theme.text_color;
-        let prefix_fg = self.theme.normal_cursor_color;
+        let minibuffer_bg = self.current_theme().minibuffer_color;
+        let content_fg = self.current_theme().text_color;
+        let prefix_fg = self.current_theme().normal_cursor_color;
         execute!(
             stdout,
             SetBackgroundColor(minibuffer_bg),
@@ -440,12 +519,21 @@ impl Editor {
     }
 
     fn open(&mut self, path: &str) -> Result<()> {
+        self.current_file_path = PathBuf::from(path);
+
         let contents = fs::read_to_string(path)
             .unwrap_or_else(|_| "".to_string());
 
         self.buffer = contents.lines()
             .map(|line| line.chars().collect())
             .collect();
+
+        // Ensure there's at least one empty line
+        if self.buffer.is_empty() {
+            self.buffer.push(Vec::new());
+        }
+
+        self.mode = Mode::Normal;
 
         Ok(())
     }
@@ -456,7 +544,7 @@ impl Editor {
         execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
         loop {
-            self.theme.apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode);
+            self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode);
             self.draw(&mut stdout)?;
 
             if let Event::Key(key) = event::read()? {
@@ -468,26 +556,56 @@ impl Editor {
                         KeyCode::Backspace => {
                             self.minibuffer_content.pop();
                         },
-                        KeyCode::Enter => {
-                            if self.mode == Mode::Dired {
-                                let file_path = self.dired.as_ref().unwrap().current_path.join(&self.minibuffer_content);
-                                // std::fs::File::create(file_path)?;
 
-                                if std::fs::File::create(file_path).is_ok() {
+                        KeyCode::Enter => {
+                            let minibuffer_content = self.minibuffer_content.clone();
+                
+                            if self.minibuffer_prefix == "Switch theme:" {
+                                self.switch_theme(&minibuffer_content);
+                            } else if self.mode == Mode::Dired {
+
+                            if self.minibuffer_prefix == "Create directory:" {
+
+                                if let Some(dired) = &mut self.dired {
+                                    dired.create_directory(&minibuffer_content)?;
+                                    dired.refresh_directory_contents()?;
+                                }
+                            } else if self.minibuffer_prefix == "Delete [y/n]:" {
+                                if minibuffer_content == "y" {
+                                    if let Some(dired) = &mut self.dired {
+                                        dired.delete_entry()?;
+                                    }
+                                } else {
+                                    // Do nothing
+                                }
+                            } else if self.minibuffer_prefix == "Rename:" {
+                               if let Some(dired) = &mut self.dired {
+                                  dired.rename_entry(&minibuffer_content)?;
+                               }
+                            } else {
+                                // Handle creating a file or directory in Dired mode
+                                let file_path = self.dired.as_ref().unwrap().current_path.join(&self.minibuffer_content);
+                                if std::fs::File::create(file_path.clone()).is_ok() {
                                     // If file creation was successful, refresh the directory listing
                                     if let Some(dired) = &mut self.dired {
                                         dired.refresh_directory_contents()?;
+                                        if self.should_open_file {
+                                            self.open(file_path.to_string_lossy().as_ref())?;
+                                        }
                                     }
                                 }
-
-                                self.minibuffer_active = false;
-                                self.minibuffer_prefix.clear();
-                                self.minibuffer_content.clear();
+                                self.should_open_file = false;
                             }
+                            }
+                            // Reset minibuffer state in all cases when Enter is pressed
+                            self.minibuffer_active = false;
+                            self.minibuffer_prefix.clear();
+                            self.minibuffer_content.clear();
                         },
                         _ => {}
                     }
                 } else {
+                    // Handle key events outside of minibuffer logic
                     match self.mode {
                         Mode::Normal => self.handle_normal_mode(key)?,
                         Mode::Insert => self.handle_insert_mode(key)?,
@@ -498,6 +616,7 @@ impl Editor {
         }
     }
 
+    
     fn set_cursor_shape(&self) {
         let shape_code = match self.mode {
             Mode::Normal => "\x1b[2 q", // Block
@@ -538,7 +657,7 @@ impl Editor {
                     *dired = Dired::new(parent_path)?;
                 }
             },
-            KeyCode::Char('l') => {
+            KeyCode::Char('l') | KeyCode::Enter => {
                 if let Some(dired) = &mut self.dired {
                     if dired.cursor_pos == 0 {
                         // Do nothing for '.'
@@ -553,17 +672,47 @@ impl Editor {
                             *dired = Dired::new(path.to_path_buf())?;
                         } else if path.is_file() {
                             self.open(&path.to_string_lossy())?;
-                            self.mode = Mode::Normal; // Or a different mode meant for editing/viewing files
                         }
                     }
                 }
             },
-
-            // TODO ('T') should touch and open the file
-            KeyCode::Char('t') => {
+             
+            KeyCode::Char('t') | KeyCode::Char('T') => {
                 self.minibuffer_active = true;
-                self.minibuffer_prefix = "Touch:".to_string();
+                self.minibuffer_prefix = if matches!(key.code, KeyCode::Char('T')) {
+                    "Touch and open:".to_string()
+                } else {
+                    "Touch:".to_string()
+                };
                 self.minibuffer_content = "".to_string();
+                self.should_open_file = matches!(key.code, KeyCode::Char('T'));
+            },
+
+            KeyCode::Char('d') => {
+                self.minibuffer_active = true;
+                self.minibuffer_prefix = "Create directory:".to_string();
+                self.minibuffer_content = "".to_string();
+            },
+
+            KeyCode::Char('D') => {
+                self.minibuffer_active = true;
+                self.minibuffer_prefix = "Delete [y/n]:".to_string();
+                self.minibuffer_content = "".to_string();
+            },
+
+            KeyCode::Char('r') => {
+                if let Some(dired) = &self.dired {
+                    // Ensure the cursor is on a valid entry (not '.' or '..')
+                    if dired.cursor_pos > 1 && (dired.cursor_pos as usize - 2) < dired.entries.len() {
+                        let entry_to_rename = &dired.entries[dired.cursor_pos as usize - 2];
+                        let entry_name = entry_to_rename.file_name().to_string_lossy().into_owned();
+
+                        // Activate the minibuffer for renaming, pre-filling it with the entry's name
+                        self.minibuffer_active = true;
+                        self.minibuffer_prefix = "Rename:".to_string();
+                        self.minibuffer_content = entry_name;
+                    }
+                }
             },
 
             KeyCode::Char('q') => {
@@ -575,50 +724,96 @@ impl Editor {
         Ok(())
     }
     
+    
     fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Char('i') => {
-                self.mode = Mode::Insert;
-                self.set_cursor_shape();
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('t') | KeyCode::Char('T'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                // Activates the minibuffer for theme switching with Ctrl+T
+                self.minibuffer_active = true;
+                self.minibuffer_prefix = "Switch theme:".to_string();
+                self.minibuffer_content = "".to_string();
             },
-            KeyCode::Char('d') => {
-                if let Some(path) = env::current_dir().ok() {
-                    self.dired = Some(Dired::new(path)?);
-                    self.mode = Mode::Dired;
-                }
-            },
-            KeyCode::Char('j') => {
-                if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
-                    self.cursor_pos.1 += 1;
-                    // Scroll down
-                    let (_, height) = size()?;
-                    // Adjust to consider the lines reserved for the minibuffer and modeline
-                    let text_area_height = height - 2; 
-                    if self.cursor_pos.1 >= self.offset.1 + text_area_height {
-                        self.offset.1 += 1;
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => match code {
+                KeyCode::Char('s') => {
+                    // Save buffer
+                    self.buffer_save()?;
+                },
+                KeyCode::Char('i') => {
+                    // Switch to insert mode
+                    self.mode = Mode::Insert;
+                    self.set_cursor_shape();
+                },
+                KeyCode::Char('d') => {
+                    // Switch to dired mode
+                    if let Some(path) = env::current_dir().ok() {
+                        self.dired = Some(Dired::new(path)?);
+                        self.mode = Mode::Dired;
                     }
-                }
-            },
-            KeyCode::Char('k') => {
-                if self.cursor_pos.1 > 0 {
-                    self.cursor_pos.1 -= 1;
-                    // Scroll up
-                    if self.cursor_pos.1 < self.offset.1 {
-                        self.offset.1 = self.offset.1.saturating_sub(1);
+                },
+                KeyCode::Char('j') => {
+                    // Move cursor down
+                    if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
+                        self.cursor_pos.1 += 1;
+                        let next_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+                        if self.cursor_pos.0 > next_line_len {
+                            self.cursor_pos.0 = next_line_len;
+                        }
+
+                        let (_, height) = size()?;
+                        let text_area_height = height - 2; // Adjust for minibuffer and modeline
+                        if self.cursor_pos.1 >= self.offset.1 + text_area_height {
+                            self.offset.1 += 1;
+                        }
                     }
-                }
-            },
-            KeyCode::Char('h') => if self.cursor_pos.0 > 0 { self.cursor_pos.0 -= 1 },
-            KeyCode::Char('l') => if self.cursor_pos.0 < self.buffer[self.cursor_pos.1 as usize].len() as u16 { self.cursor_pos.0 += 1 },
-            KeyCode::Char('q') => {
-                disable_raw_mode()?;
-                execute!(stdout(), terminal::LeaveAlternateScreen, cursor::Show)?;
-                std::process::exit(0);
+                },
+                KeyCode::Char('k') => {
+                    // Move cursor up
+                    if self.cursor_pos.1 > 0 {
+                        self.cursor_pos.1 -= 1;
+
+                        let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+                        if self.cursor_pos.0 > prev_line_len {
+                            self.cursor_pos.0 = prev_line_len;
+                        }
+
+                        if self.cursor_pos.1 < self.offset.1 {
+                            self.offset.1 = self.offset.1.saturating_sub(1);
+                        }
+                    }
+                },
+                KeyCode::Char('h') => {
+                    // Move cursor left
+                    if self.cursor_pos.0 > 0 {
+                        self.cursor_pos.0 -= 1;
+                    }
+                },
+                KeyCode::Char('l') => {
+                    // Move cursor right
+                    if self.cursor_pos.0 < self.buffer[self.cursor_pos.1 as usize].len() as u16 {
+                        self.cursor_pos.0 += 1;
+                    }
+                },
+                KeyCode::Char('q') => {
+                    // Quit the editor
+                    disable_raw_mode()?;
+                    execute!(stdout(), terminal::LeaveAlternateScreen, cursor::Show)?;
+                    std::process::exit(0);
+                },
+                _ => {}
             },
             _ => {}
         }
         Ok(())
     }
+
 
     fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
@@ -679,7 +874,7 @@ struct Theme {
 }
 
 impl Theme {
-    fn new() -> Self {
+    fn nature() -> Self {
         Theme {
             background_color: hex_to_rgb("#090909").unwrap(),
             text_color: hex_to_rgb("#9995BF").unwrap(),
@@ -702,6 +897,32 @@ impl Theme {
             ok_color: hex_to_rgb("#4C6750").unwrap(),
         }
     }
+
+    fn everforest_medium() -> Self {
+        Theme {
+            background_color: hex_to_rgb("#2D353B").unwrap(),
+            text_color: hex_to_rgb("#D3C6AA").unwrap(),
+            normal_cursor_color: hex_to_rgb("#A7C080").unwrap(), 
+            insert_cursor_color: hex_to_rgb("#E67E80").unwrap(), 
+            fringe_color: hex_to_rgb("#2D353B").unwrap(), 
+            line_numbers_color: hex_to_rgb("#3D484D").unwrap(), 
+            current_line_number_color: hex_to_rgb("#A7C080").unwrap(), 
+            modeline_color: hex_to_rgb("#3D484D").unwrap(), 
+            modeline_lighter_color: hex_to_rgb("#475258").unwrap(), 
+            minibuffer_color: hex_to_rgb("#232A2E").unwrap(), 
+            dired_mode_color: hex_to_rgb("#D699B6").unwrap(), 
+            dired_timestamp_color: hex_to_rgb("#D699B6").unwrap(), 
+            dired_path_color: hex_to_rgb("#A7C080").unwrap(), 
+            dired_size_color: hex_to_rgb("#3D484D").unwrap(), 
+            dired_dir_color: hex_to_rgb("#A7C080").unwrap(), 
+            comment_color: hex_to_rgb("#3D484D").unwrap(), 
+            warning_color: hex_to_rgb("#DBBC7F").unwrap(), 
+            error_color: hex_to_rgb("#E67E80").unwrap(), 
+            ok_color: hex_to_rgb("#A7C080").unwrap(), 
+        }
+    }
+
+
     
     fn apply_cursor_color(&self, cursor_pos: (u16, u16), buffer: &Vec<Vec<char>>, mode: &Mode) {
         let is_over_text = if let Mode::Normal = mode {
