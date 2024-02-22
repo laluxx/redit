@@ -6,7 +6,7 @@ use crossterm::{
     cursor::{self, MoveTo},
 };
 
-use std::{fs::create_dir, io::{self, stdout, Stdout, Write}};
+use std::io::{self, stdout, Stdout, Write};
 use std::io::Result;
 use std::env;
 use std::fs;
@@ -16,6 +16,10 @@ use std::fs::DirEntry;
 use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
+
+// extern crate tree_sitter;
+// extern crate tree_sitter_rust;
+
 
 #[derive(PartialEq)]
 enum Mode {
@@ -229,17 +233,18 @@ struct Editor {
     cursor_pos: (u16, u16),
     offset: (u16, u16),
     buffer: Vec<Vec<char>>,
-    // theme: Theme,
     themes: HashMap<String, Theme>,
     current_theme_name: String,
     show_fringe: bool,
     show_line_numbers: bool,
     insert_line_cursor: bool,
     minibuffer_active: bool,
+    minibuffer_height: u16,
     minibuffer_content: String,
     minibuffer_prefix: String,
     current_file_path: PathBuf,
     should_open_file: bool,
+    fzy: Fzy,
 }
 
 impl Editor {
@@ -248,6 +253,7 @@ impl Editor {
         themes.insert("nature".to_string(), Theme::nature());
         themes.insert("everforest".to_string(), Theme::everforest_medium());
         let initial_theme_name = "nature".to_string();
+        let current_path = env::current_dir().unwrap();
 
         Editor { 
             mode: Mode::Normal, 
@@ -261,10 +267,12 @@ impl Editor {
             insert_line_cursor: false,
             dired: None,
             minibuffer_active: false,
+            minibuffer_height: 1,
             minibuffer_content: String::new(),
             minibuffer_prefix: String::new(),
-            current_file_path: env::current_dir().unwrap(),
+            current_file_path: current_path.clone(),
             should_open_file: false,
+            fzy: Fzy::new(current_path),
         }
     }
 
@@ -315,6 +323,12 @@ impl Editor {
         self.draw_modeline(stdout, width, height)?;
         self.draw_minibuffer(stdout, width, height)?;
 
+
+        if self.fzy.active {
+            let theme = self.current_theme();
+            self.fzy.draw(stdout, theme)?;
+        }
+        
         if self.mode == Mode::Dired {
             if let Some(mut dired) = self.dired.take() { // Temporarily take `dired` out of `self`
                 let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
@@ -341,59 +355,66 @@ impl Editor {
             self.draw_text(stdout)?;
         }
 
-        // Calculate and set the cursor position
+        // Calculate cursor pos
         let cursor_pos = if self.minibuffer_active {
             let minibuffer_cursor_pos_x = 2 + self.minibuffer_prefix.len() as u16 + self.minibuffer_content.len() as u16;
-            (minibuffer_cursor_pos_x, height - 1) // Adjust for minibuffer's position at the bottom
+            let minibuffer_cursor_pos_y = height - self.minibuffer_height;
+            (minibuffer_cursor_pos_x, minibuffer_cursor_pos_y)
         } else if self.mode == Mode::Dired {
             self.dired.as_ref().map_or((0, 0), |dired| {
-                let cursor_line = dired.cursor_pos + 2; // Skip '.' and '..'
+                let cursor_line = (dired.cursor_pos + 2).min(height - self.minibuffer_height - 1);
                 (dired.entry_first_char_column, cursor_line)
             })
         } else {
             let mut start_col = 0;
             if self.show_fringe {
-                start_col += 2; // Account for fringe column
+                start_col += 2; // Account for fringe
             }
             if self.show_line_numbers {
-                start_col += 4; // Account for line number columns
+                start_col += 4; // Account for line number
             }
             let cursor_x = self.cursor_pos.0.saturating_sub(self.offset.0) + start_col;
-            let cursor_y = self.cursor_pos.1.saturating_sub(self.offset.1);
+            // Ensure cursor Y-position doesn't go into the minibuffer area or below.
+            let cursor_y = (self.cursor_pos.1.saturating_sub(self.offset.1)).min(height - self.minibuffer_height - 2);
             (cursor_x, cursor_y)
         };
 
+        
         // Position the cursor
         execute!(
             stdout,
             cursor::MoveTo(cursor_pos.0, cursor_pos.1),
             cursor::Show
         )?;
-
+        
         io::stdout().flush()?;
         Ok(())
     }
-    
+
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-        let (width, height) = size()?; // TODO horizontal scrolling
+        let (width, height) = size()?; // Retrieve terminal dimensions. Consider horizontal scrolling in the future.
         let text_color = self.current_theme().text_color;
         let mut start_col = 0;
 
+        // Adjust the starting column based on whether fringe and line numbers are shown.
         if self.show_fringe {
-            start_col += 2;
+            start_col += 2; // Fringe width
         }
 
         if self.show_line_numbers {
-            start_col += 4;
+            start_col += 4; // Space for line numbers
         }
 
-        execute!(
-            stdout,
-            SetForegroundColor(text_color)
-        )?;
+        // Set the text color for drawing the buffer content.
+        execute!(stdout, SetForegroundColor(text_color))?;
 
+        // Calculate the total area to exclude from the bottom: modeline (1 line) + minibuffer height.
+        let bottom_exclude = self.minibuffer_height + 1;
+
+        // Adjust drawing to only fill up to the dynamically determined area.
         for (idx, line) in self.buffer.iter().enumerate() {
-            if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - 2) as usize {
+            // Adjust the condition to stop drawing text where the modeline and minibuffer begin.
+            if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
                 let line_content: String = line.iter().collect();
                 execute!(
                     stdout,
@@ -406,11 +427,14 @@ impl Editor {
         Ok(())
     }
 
-
     // TODO ~ after the last line 3 options only one, none or untile the end
     fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
         if self.show_line_numbers {
-            for y in 0..height - 2 { // Excluding modeline and minibuffer
+            // Calculate the total area to exclude from the bottom: modeline (1 line) + minibuffer height.
+            let bottom_exclude = self.minibuffer_height + 1;
+
+            // Adjust the loop to exclude the calculated bottom area when drawing line numbers.
+            for y in 0..height - bottom_exclude { // Dynamically exclude modeline and minibuffer
                 let line_index = (self.offset.1 as usize) + y as usize; // Calculate line index considering offset
                 if line_index < self.buffer.len() { // Check if line exists
                     let absolute_line_number = line_index + 1;
@@ -435,11 +459,15 @@ impl Editor {
         }
         Ok(())
     }
-    
+
     fn draw_fringe(&self, stdout: &mut io::Stdout, height: u16) -> Result<()> {
         if self.show_fringe {
             let fringe_color = self.current_theme().fringe_color;
-            for y in 0..height - 2 { // Exclude modeline and minibuffer
+            // Calculate the total area to exclude from the bottom: modeline (1 line) + minibuffer height.
+            let bottom_exclude = self.minibuffer_height + 1;
+
+            // Adjust the loop to exclude the calculated bottom area.
+            for y in 0..height - bottom_exclude { 
                 execute!(
                     stdout,
                     MoveTo(0, y),
@@ -455,21 +483,24 @@ impl Editor {
         let sep_r = "";
         let sep_l = "";
 
-        // Determine what to display based on the current mode
+        // Adjust the Y-coordinate of the modeline to be one line above the minibuffer.
+        let modeline_y = height - self.minibuffer_height - 1;
+
+        // Determine what to display based on the current mode.
         let display_str = match self.mode {
             Mode::Dired => {
-                // In Dired mode, use the current directory from the Dired struct
+                // In Dired mode, use the current directory from the Dired struct.
                 if let Some(dired) = &self.dired {
                     format!("󰉋 {}", dired.current_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("")).to_str().unwrap())
                 } else {
                     "󰉋 Unknown".to_string()
                 }
             },
-            // In other modes, display just the file name from `current_file_path`
+            // In other modes, display just the file name from `current_file_path`.
             _ => self.current_file_path.file_name().map_or("Untitled".to_string(), |os_str| os_str.to_str().unwrap_or("Untitled").to_string()),
         };
 
-        // Mode string, background, and text color setup remains unchanged
+        // Mode string, background, and text color setup remains unchanged.
         let (mode_str, mode_bg_color, mode_text_color) = match self.mode {
             Mode::Normal => ("NORMAL", self.current_theme().normal_cursor_color, Color::Black),
             Mode::Insert => ("INSERT", self.current_theme().insert_cursor_color, Color::Black),
@@ -480,8 +511,8 @@ impl Editor {
         let file_text_color = self.current_theme().text_color;
         let modeline_bg_color = self.current_theme().modeline_color;
 
-        // Drawing logic begins here
-        execute!(stdout, SetBackgroundColor(mode_bg_color), MoveTo(0, height - 2), Print(" "))?;
+        // Adjusted drawing logic to use `modeline_y` for the Y-coordinate.
+        execute!(stdout, SetBackgroundColor(mode_bg_color), MoveTo(0, modeline_y), Print(" "))?;
         execute!(stdout, SetForegroundColor(mode_text_color), SetAttribute(Attribute::Bold), Print(format!(" {} ", mode_str)), SetAttribute(Attribute::Reset))?;
         execute!(stdout, SetBackgroundColor(file_bg_color), SetForegroundColor(mode_bg_color), Print(sep_r))?;
         execute!(stdout, SetBackgroundColor(file_bg_color), Print(" "))?;
@@ -504,18 +535,30 @@ impl Editor {
 
         Ok(())
     }
-    
+
     fn draw_minibuffer(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
         let minibuffer_bg = self.current_theme().minibuffer_color;
         let content_fg = self.current_theme().text_color;
         let prefix_fg = self.current_theme().normal_cursor_color;
+
+        // Calculate the start position for the minibuffer based on its height.
+        let minibuffer_start_y = height - self.minibuffer_height;
+
+        // Fill the minibuffer background for its entire height.
+        for y_offset in 0..self.minibuffer_height {
+            execute!(
+                stdout,
+                MoveTo(0, minibuffer_start_y + y_offset),
+                SetBackgroundColor(minibuffer_bg),
+                Print(" ".repeat(width as usize))
+            )?;
+        }
+
+        // Draw the minibuffer prefix and content on the first line of the minibuffer area.
         execute!(
             stdout,
-            SetBackgroundColor(minibuffer_bg),
+            MoveTo(0, minibuffer_start_y),
             SetForegroundColor(prefix_fg),
-            MoveTo(0, height - 1),
-            Print(" ".repeat(width as usize)), // Fill minibuffer background
-            MoveTo(0, height - 1),
             Print(format!(" {}", self.minibuffer_prefix)),
             SetForegroundColor(content_fg),
             Print(format!(" {}", self.minibuffer_content))
@@ -524,7 +567,8 @@ impl Editor {
         Ok(())
     }
 
-    fn open(&mut self, path: &str) -> Result<()> {
+    // TODO if it's a directory open the directory in dired
+    pub fn open(&mut self, path: &str) -> Result<()> {
         self.current_file_path = PathBuf::from(path);
 
         let contents = fs::read_to_string(path)
@@ -554,6 +598,16 @@ impl Editor {
             self.draw(&mut stdout)?;
 
             if let Event::Key(key) = event::read()? {
+                if self.fzy.active {
+                    // take and replace
+                    let mut fzy_temp = std::mem::replace(&mut self.fzy, Fzy::new(PathBuf::new()));
+                    let state_changed = fzy_temp.handle_input(key, self);
+                    self.fzy = fzy_temp;
+                    if state_changed {
+                        self.minibuffer_height = 1;
+                    }
+                }
+
                 if self.minibuffer_active {
                     match key.code {
                         KeyCode::Char(c) => {
@@ -561,6 +615,12 @@ impl Editor {
                         },
                         KeyCode::Backspace => {
                             self.minibuffer_content.pop();
+                        },
+
+                        KeyCode::Esc => {
+                            self.minibuffer_active = false;
+                            self.minibuffer_prefix.clear();
+                            self.minibuffer_content.clear();
                         },
 
                         KeyCode::Enter => {
@@ -611,11 +671,12 @@ impl Editor {
                         _ => {}
                     }
                 } else {
-                    // Handle key events outside of minibuffer logic
-                    match self.mode {
-                        Mode::Normal => self.handle_normal_mode(key)?,
-                        Mode::Insert => self.handle_insert_mode(key)?,
-                        Mode::Dired => self.handle_dired_mode(key)?,
+                    if !self.fzy.active {
+                        match self.mode {
+                            Mode::Normal => self.handle_normal_mode(key)?,
+                            Mode::Insert => self.handle_insert_mode(key)?,
+                            Mode::Dired => self.handle_dired_mode(key)?,
+                        }
                     }
                 }
             }
@@ -764,8 +825,13 @@ impl Editor {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => match code {
+                KeyCode::Char('f') => {
+                    self.fzy.active = true;
+                    self.fzy.input.clear();
+                    self.fzy.update_items();
+                    self.minibuffer_height = 8;
+                },
                 KeyCode::Char('s') => {
-                    // Save buffer
                     self.buffer_save()?;
                 },
                 KeyCode::Char('i') => {
@@ -781,7 +847,6 @@ impl Editor {
                     }
                 },
                 KeyCode::Char('j') => {
-                    // Move cursor down
                     if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
                         self.cursor_pos.1 += 1;
                         let next_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
@@ -790,7 +855,9 @@ impl Editor {
                         }
 
                         let (_, height) = size()?;
-                        let text_area_height = height - 2; // Adjust for minibuffer and modeline
+                        let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
+
+                        // Adjust offset if cursor moves beyond the last line of the text area
                         if self.cursor_pos.1 >= self.offset.1 + text_area_height {
                             self.offset.1 += 1;
                         }
@@ -833,6 +900,7 @@ impl Editor {
             },
             _ => {}
         }
+
         Ok(())
     }
 
@@ -1000,4 +1068,180 @@ fn hex_to_rgb(hex: &str) -> std::result::Result<Color, &'static str> {
         Err("Invalid hex format")
     }
 }
+
+
+struct Fzy {
+    active: bool,
+    items: Vec<String>,
+    input: String,
+    selection_index: usize,
+    visible_lines: usize,
+    current_path: PathBuf,
+}
+
+impl Fzy {
+    fn new(current_path: PathBuf) -> Self {
+        Fzy {
+            active: false,
+            items: Vec::new(),
+            input: String::new(),
+            selection_index: 0,
+            visible_lines: 7,
+            current_path,
+        }
+    }
+
+    fn update_items(&mut self) {
+        let entries = std::fs::read_dir(&self.current_path)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let file_name = path.file_name()?.to_str()?.to_owned();
+                if file_name.contains(&self.input) {
+                    Some(file_name)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<String>>();
+        
+        self.items = entries;
+        self.selection_index = 0; // Reset selection index on each update
+    }
+
+
+    fn draw(&self, stdout: &mut Stdout, theme: &Theme) -> io::Result<()> {
+        let (width, height) = terminal::size()?; // Get the terminal size for full width utilization
+
+        let start_y = height - self.visible_lines as u16 - 1; // Leave room for visible items below
+
+        let counter_format = format!(" {:}/{:<2} ", self.selection_index + 1, self.items.len());
+
+        // Keep the counter and prefix in normal_cursor_color, but ensure the input text uses text_color
+        execute!(
+            stdout,
+            MoveTo(1, start_y),
+            SetForegroundColor(theme.normal_cursor_color),
+            Print(counter_format),
+            Print("Find file: "),
+            SetForegroundColor(theme.text_color),
+            Print(&self.input)
+        )?;
+
+        let scroll_threshold = 5;
+        let start_index = if self.selection_index >= scroll_threshold && self.items.len() > self.visible_lines {
+            self.selection_index + 1 - scroll_threshold
+        } else {
+            0
+        };
+
+        for (index, item) in self.items.iter().enumerate().skip(start_index).take(self.visible_lines) {
+            let y_pos = start_y + index as u16 + 1 - start_index as u16;
+
+            if index == self.selection_index {
+                // Highlight the entire line
+                execute!(
+                    stdout,
+                    MoveTo(0, y_pos),
+                    SetBackgroundColor(theme.normal_cursor_color),
+                    Print(" ".repeat(width as usize)),
+                    SetForegroundColor(theme.text_color),
+                    MoveTo(1, y_pos),
+                    Print(item),
+                    SetBackgroundColor(theme.background_color)
+                )?;
+            } else {
+                execute!(
+                    stdout,
+                    MoveTo(1, y_pos),
+                    SetForegroundColor(theme.text_color),
+                    Print(item)
+                )?;
+            }
+        }
+
+        // Ensure the terminal cursor is moved out of the way
+        execute!(
+            stdout,
+            MoveTo(0, height - 1)
+        )?;
+
+        Ok(())
+    }
+
+
+
+    pub fn handle_input(&mut self, key: KeyEvent, editor: &mut Editor) -> bool {
+        let mut state_changed = false;
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                if self.selection_index < self.items.len() - 1 {
+                    self.selection_index += 1;
+                }
+            },
+            
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                if self.selection_index > 0 {
+                    self.selection_index -= 1;
+                }
+            },
+            
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => match code {
+                KeyCode::Char(c) => {
+                    self.input.push(c);
+                    self.update_items();
+                },
+                KeyCode::Backspace => {
+                    self.input.pop();
+                    self.update_items();
+                },
+                KeyCode::Up => {
+                    if self.selection_index > 0 {
+                        self.selection_index -= 1;
+                    }
+                },
+                KeyCode::Down => {
+                    if self.selection_index < self.items.len() - 1 {
+                        self.selection_index += 1;
+                    }
+                },
+                KeyCode::Esc => {
+                    self.active = false;
+                    self.input.clear();
+                    self.items.clear();
+                    state_changed = true; // Indicate that the fuzzy finder was deactivated
+                },
+                KeyCode::Enter => {
+                    if let Some(item) = self.items.get(self.selection_index) {
+                        println!("Selected: {}", item);
+                        editor.open(item);
+                        self.active = false;
+                        self.input.clear();
+                        self.items.clear();
+                        state_changed = true; // Assume state changes upon selection
+                    }
+                },
+                _ => {}
+            },
+            _ => {}
+        }
+
+        state_changed // Return whether the fuzzy finder's state has changed
+    }
+}
+
 
