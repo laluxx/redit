@@ -262,6 +262,8 @@ struct Editor {
     messages: Vec<String>,
     last_message_time: Option<std::time::Instant>,
     clipboard: String,
+    searching: bool,
+    search_query: String,
 }
 
 impl Editor {
@@ -293,6 +295,8 @@ impl Editor {
             messages: Vec::new(),
             last_message_time: None,
             clipboard: String::new(),
+            searching: false,
+            search_query: String::new(),
         }
     }
 
@@ -385,6 +389,42 @@ impl Editor {
             self.cursor_pos.0 += 1;
         }
     }
+
+    // TODO doesnt work above 
+    fn adjust_view_to_cursor(&mut self) {
+        let (_, height) = terminal::size().unwrap();
+        let text_area_height = height - self.minibuffer_height - 1;
+
+        if self.cursor_pos.1 < self.offset.1 {
+            self.offset.1 = self.cursor_pos.1;
+        }
+        else if self.cursor_pos.1 >= (self.offset.1 + text_area_height) {
+            self.offset.1 = self.cursor_pos.1 - text_area_height + 1;
+        }
+    }
+    
+    fn join(&mut self) {
+        if self.cursor_pos.1 as usize + 1 < self.buffer.len() {
+            let next_line = self.buffer.remove(self.cursor_pos.1 as usize + 1);
+
+            if let Some(current_line) = self.buffer.get_mut(self.cursor_pos.1 as usize) {
+                // Determine if the current line ends with a non-whitespace character
+                let ends_with_non_whitespace = current_line.iter().rev().find(|&&c| c != ' ').is_some();
+                
+                // Create a trimmed version of the next line (remove leading whitespace)
+                let trimmed_next_line: Vec<char> = next_line.into_iter().skip_while(|&c| c == ' ').collect();
+
+                // ensure a single space is added between the lines.
+                if ends_with_non_whitespace && !trimmed_next_line.is_empty() {
+                    current_line.push(' ');
+                }
+
+                // Extend the current line with the trimmed next line
+                current_line.extend(trimmed_next_line);
+            }
+        }
+    }
+
     
     fn open_below(&mut self) {
         if let Some(current_line) = self.buffer.get(self.cursor_pos.1 as usize) {
@@ -547,36 +587,93 @@ impl Editor {
         Ok(())
     }
 
+    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
+    //     let (width, height) = size()?; // TODO Horizzonatl scroll
+    //     let text_color = self.current_theme().text_color;
+    //     let mut start_col = 0;
+
+    //     if self.show_fringe {
+    //         start_col += 2; // Fringe width
+    //     }
+
+    //     if self.show_line_numbers {
+    //         start_col += 4; // Space for line numbers
+    //     }
+
+    //     execute!(stdout, SetForegroundColor(text_color))?; // Set the text color
+    //     let bottom_exclude = self.minibuffer_height + 1; // Calculate area to exclude
+
+    //     for (idx, line) in self.buffer.iter().enumerate() {
+    //         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+    //             let line_content: String = line.iter().collect();
+    //             execute!(
+    //                 stdout,
+    //                 MoveTo(start_col, (idx - self.offset.1 as usize) as u16),
+    //                 Print(line_content)
+    //             )?;
+    //         }
+    //     }
+
+    //     Ok(())
+    // }
+
+        
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
         let (width, height) = size()?; // TODO Horizzonatl scroll
         let text_color = self.current_theme().text_color;
-        let mut start_col = 0;
+        let search_bg_color = self.current_theme().search_bg_color;
+        let background_color = self.current_theme().background_color;
+        let mut start_col_base = 0;
 
         if self.show_fringe {
-            start_col += 2; // Fringe width
+            start_col_base += 2; // Account for fringe width
         }
 
         if self.show_line_numbers {
-            start_col += 4; // Space for line numbers
+            start_col_base += 4; // Space for line numbers
         }
 
-        execute!(stdout, SetForegroundColor(text_color))?; // Set the text color
-        let bottom_exclude = self.minibuffer_height + 1; // Calculate area to exclude
+        let bottom_exclude = self.minibuffer_height + 1; // Bottom area to exclude (minibuffer)
 
         for (idx, line) in self.buffer.iter().enumerate() {
             if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
                 let line_content: String = line.iter().collect();
-                execute!(
-                    stdout,
-                    MoveTo(start_col, (idx - self.offset.1 as usize) as u16),
-                    Print(line_content)
-                )?;
+                let line_y = (idx - self.offset.1 as usize) as u16;
+
+                if self.searching && !self.minibuffer_content.is_empty() {
+                    // Split and highlight search matches
+                    let mut current_col = start_col_base;
+                    let mut last_index = 0;
+
+                    for (start, part) in line_content.match_indices(&self.minibuffer_content) {
+                        // Print preceding text
+                        let preceding_text = &line_content[last_index..start];
+                        execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(preceding_text))?;
+                        current_col += preceding_text.len() as u16;
+
+                        // Highlight match
+                        execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(search_bg_color), Print(part))?;
+                        current_col += part.len() as u16;
+
+                        last_index = start + part.len();
+                    }
+
+                    // Print trailing text
+                    let trailing_text = &line_content[last_index..];
+                    execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(trailing_text))?;
+                } else {
+                    // Print line normally if not searching or no search term is provided
+                    execute!(stdout, MoveTo(start_col_base, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(line_content))?;
+                }
             }
         }
 
         Ok(())
     }
 
+
+
+        
     // TODO ~ after the last line 3 options only one, none or untile the end
     fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
         if self.show_line_numbers {
@@ -776,11 +873,40 @@ impl Editor {
                             self.minibuffer_active = false;
                             self.minibuffer_prefix.clear();
                             self.minibuffer_content.clear();
+                            self.searching = false;
+                            self.search_query.clear();
                         },
                         KeyCode::Enter => {
                             let minibuffer_content = std::mem::take(&mut self.minibuffer_content);
                             if self.minibuffer_prefix == "Switch theme:" {
                                 self.switch_theme(&minibuffer_content);
+                            } else if self.minibuffer_prefix == "Search:" {
+                                // Copy search query to a persistent variable if needed.
+                                self.search_query = minibuffer_content.clone();
+                                
+                                // Find the next occurrence of the search query from the cursor's current position.
+                                let mut found = false;
+                                for (line_idx, line) in self.buffer.iter().enumerate().skip(self.cursor_pos.1 as usize) {
+                                    // Determine start index for search in the current line.
+                                    let start_search_idx = if line_idx == self.cursor_pos.1 as usize { self.cursor_pos.0 as usize + 1 } else { 0 };
+                                    if let Some(match_idx) = line.iter().skip(start_search_idx).collect::<String>().find(&minibuffer_content) {
+                                        // Update cursor position to the start of the found match.
+                                        self.cursor_pos = (match_idx as u16, line_idx as u16);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+
+                                // If no match is found after the current cursor position, optionally wrap the search to the beginning of the document.
+                                if !found {
+                                    for (line_idx, line) in self.buffer.iter().enumerate().take(self.cursor_pos.1 as usize + 1) {
+                                        if let Some(match_idx) = line.iter().collect::<String>().find(&minibuffer_content) {
+                                            self.cursor_pos = (match_idx as u16, line_idx as u16);
+                                            break;
+                                        }
+                                    }
+                                }
+                                self.adjust_view_to_cursor();
                             } else if self.mode == Mode::Dired {
                                 if self.minibuffer_prefix == "Create directory:" {
                                     if let Some(dired) = &mut self.dired {
@@ -969,7 +1095,13 @@ impl Editor {
             } => {
                 self.enter();
             }
-
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.backspace();
+            }
             KeyEvent {
                 code: KeyCode::Char('l'),
                 modifiers: KeyModifiers::CONTROL,
@@ -1030,6 +1162,13 @@ impl Editor {
             } => {
                 self.kill_line();
             },
+            KeyEvent {
+                code: KeyCode::Char('J'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.join();
+            },
 
             KeyEvent {
                 code,
@@ -1048,6 +1187,11 @@ impl Editor {
                         fzy.recalculate_positions();
                         self.minibuffer_height = fzy.calculate_minibuffer_height(fzy.max_visible_lines) as u16;
                     }
+                },
+                KeyCode::Char('/') => {
+                    self.searching = true;
+                    self.minibuffer_active = true;
+                    self.minibuffer_prefix = "Search:".to_string();
                 },
                 KeyCode::Char('0') => {
                     self.cursor_pos.0 = 0;
@@ -1183,6 +1327,7 @@ struct Theme {
     warning_color: Color,
     error_color: Color,
     ok_color: Color,
+    search_bg_color: Color,
 }
 
 impl Theme {
@@ -1207,6 +1352,7 @@ impl Theme {
             warning_color: hex_to_rgb("#565663").unwrap(),
             error_color: hex_to_rgb("#444E46").unwrap(),
             ok_color: hex_to_rgb("#4C6750").unwrap(),
+            search_bg_color: hex_to_rgb("#3B5238").unwrap(),
         }
     }
 
@@ -1231,6 +1377,7 @@ impl Theme {
             warning_color: hex_to_rgb("#DBBC7F").unwrap(), 
             error_color: hex_to_rgb("#E67E80").unwrap(), 
             ok_color: hex_to_rgb("#A7C080").unwrap(), 
+            search_bg_color: hex_to_rgb("#E67E80").unwrap(),
         }
     }
 
@@ -1282,7 +1429,6 @@ fn main() -> Result<()> {
     let mut editor = Editor::new();
 
     if args.len() > 1 {
-        // let file_path = &args[1];
         let file_path = PathBuf::from(&args[1]);
         editor.open(&file_path, None)?;
     }
