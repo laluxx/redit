@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 
+use std::time::{Instant, Duration};
+
 // TODO Syntax highlighting
 // extern crate tree_sitter;
 // extern crate tree_sitter_rust;
@@ -61,7 +63,6 @@ impl Dired {
             color_dired: true,
         })
     }
-    
 
     fn list_directory_contents(path: &PathBuf) -> io::Result<Vec<DirEntry>> {
         let mut entries = Vec::new();
@@ -121,7 +122,7 @@ impl Dired {
         Ok(())
     }
 
-    // TODO color file extentions if color_dired is true, fix background
+    // TODO color file extentions if color_dired is true
     // TODO scrolling, it overlap the modeline..
     pub fn draw_dired(&mut self, stdout: &mut Stdout, height: u16, theme: &Theme) -> io::Result<()> {
         let display_path = self.current_path.display().to_string();
@@ -258,6 +259,9 @@ struct Editor {
     current_file_path: PathBuf,
     should_open_file: bool,
     fzy: Option<Fzy>,
+    messages: Vec<String>,
+    last_message_time: Option<std::time::Instant>,
+    clipboard: String,
 }
 
 impl Editor {
@@ -285,8 +289,10 @@ impl Editor {
             minibuffer_prefix: String::new(),
             current_file_path: current_path.clone(),
             should_open_file: false,
-            // fzy: Fzy::new(current_path),
             fzy: Some(Fzy::new(current_path)),
+            messages: Vec::new(),
+            last_message_time: None,
+            clipboard: String::new(),
         }
     }
 
@@ -298,7 +304,7 @@ impl Editor {
         if self.themes.contains_key(theme_name) {
             self.current_theme_name = theme_name.to_string();
         } else {
-            // TODO implement message() theme doesn't exist 
+            self.message("Theme doesn't exist");
         }
     }
 
@@ -320,6 +326,122 @@ impl Editor {
         self.buffer.insert(self.cursor_pos.1 as usize + 1, tail);
         self.cursor_pos.1 += 1;
         self.cursor_pos.0 = 0;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor_pos.0 > 0 {
+            self.buffer[self.cursor_pos.1 as usize].remove((self.cursor_pos.0 - 1) as usize);
+            self.cursor_pos.0 -= 1;
+        } else if self.cursor_pos.1 > 0 {
+            // Handle removing an entire line and moving up
+            let current_line = self.buffer.remove(self.cursor_pos.1 as usize);
+            self.cursor_pos.1 -= 1;
+            self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+            self.buffer[self.cursor_pos.1 as usize].extend(current_line);
+        }
+    }
+
+    fn up(&mut self) {
+        if self.cursor_pos.1 > 0 {
+            self.cursor_pos.1 -= 1;
+
+            let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+            if self.cursor_pos.0 > prev_line_len {
+                self.cursor_pos.0 = prev_line_len;
+            }
+
+            if self.cursor_pos.1 < self.offset.1 {
+                self.offset.1 = self.offset.1.saturating_sub(1);
+            }
+        }
+    }
+
+    fn down(&mut self) {
+        if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
+            self.cursor_pos.1 += 1;
+            let next_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+            if self.cursor_pos.0 > next_line_len {
+                self.cursor_pos.0 = next_line_len;
+            }
+
+            let (_, height) = size().unwrap();
+            let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
+
+            // Adjust offset if cursor moves beyond the last line of the text area
+            if self.cursor_pos.1 >= self.offset.1 + text_area_height {
+                self.offset.1 += 1;
+            }
+        }
+    }
+
+    fn left(&mut self) {
+        if self.cursor_pos.0 > 0 {
+            self.cursor_pos.0 -= 1;
+        }
+    }
+
+    fn right(&mut self) {
+        if self.cursor_pos.0 < self.buffer[self.cursor_pos.1 as usize].len() as u16 {
+            self.cursor_pos.0 += 1;
+        }
+    }
+    
+    fn open_below(&mut self) {
+        if let Some(current_line) = self.buffer.get(self.cursor_pos.1 as usize) {
+            let indentation = current_line.iter().take_while(|&&c| c == ' ').count();
+            let new_line_indentation = vec![' '; indentation];
+            let new_line_index = self.cursor_pos.1 as usize + 1;
+            self.buffer.insert(new_line_index, new_line_indentation);
+        } else {
+            // If for some reason we're beyond the buffer, just insert a blank new line
+            self.buffer.insert(self.cursor_pos.1 as usize + 1, Vec::new());
+        }
+
+        self.cursor_pos.1 += 1;
+        self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16; // Move cursor to the end of the indentation
+        self.mode = Mode::Insert;
+    }
+
+    fn open_above(&mut self) {
+        let indentation = if let Some(current_line) = self.buffer.get(self.cursor_pos.1 as usize) {
+            current_line.iter().take_while(|&&c| c == ' ').count()
+        } else {
+            0 // Default to no indentation
+        };
+        let new_line_indentation = vec![' '; indentation];
+        self.buffer.insert(self.cursor_pos.1 as usize, new_line_indentation);
+        self.cursor_pos.0 = indentation as u16;
+        self.mode = Mode::Insert;
+    }
+
+    fn kill_line(&mut self) {
+        if let Some(line) = self.buffer.get_mut(self.cursor_pos.1 as usize) {
+            if line.len() > self.cursor_pos.0 as usize {
+                // Remove text from the cursor to the end of the line and store it in the clipboard
+                let removed_text: String = line.drain(self.cursor_pos.0 as usize..).collect();
+                self.clipboard = removed_text; // Replace the clipboard content
+            } else {
+                // If the cursor is at the end of the line or the line is empty, remove the line
+                if self.cursor_pos.1 as usize != self.buffer.len() - 1 {
+                    self.buffer.remove(self.cursor_pos.1 as usize);
+                    // Consider adding an empty string to the clipboard or handling differently
+                    self.clipboard.clear();
+                }
+            }
+        }
+    }
+
+    fn paste(&mut self) {
+        if let Some(line) = self.buffer.get_mut(self.cursor_pos.1 as usize) {
+            let paste_position = self.cursor_pos.0 as usize;
+            // Split the current line at the cursor, insert the clipboard content, and then the rest of the line
+            let rest_of_line: String = line.drain(paste_position..).collect();
+            let clipboard_content: Vec<char> = self.clipboard.chars().collect();
+            line.extend(clipboard_content);
+            line.extend(rest_of_line.chars());
+            // Move the cursor to the end of the pasted content
+            self.cursor_pos.0 += self.clipboard.chars().count() as u16;
+        }
     }
 
     fn dired_jump(&mut self) {
@@ -555,7 +677,13 @@ impl Editor {
         Ok(())
     }
 
-    fn draw_minibuffer(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    pub fn message(&mut self, msg: &str) {
+        self.minibuffer_content = msg.to_string();
+        self.last_message_time = Some(std::time::Instant::now());
+        self.messages.push(msg.to_string());
+    }
+    
+    fn draw_minibuffer(&mut self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
         let minibuffer_bg = self.current_theme().minibuffer_color;
         let content_fg = self.current_theme().text_color;
         let prefix_fg = self.current_theme().normal_cursor_color;
@@ -572,7 +700,17 @@ impl Editor {
             )?;
         }
 
-        // Draw minibuffer prefix and content
+        // Automatically clear the message
+        if let Some(last_message_time) = self.last_message_time {
+            if last_message_time.elapsed() > Duration::from_millis(1) {
+                // Clear only the message content if the time threshold is exceeded.
+                self.minibuffer_content.clear();
+                // Reset the last message time to None to prevent repeated clearing in future draws.
+                self.last_message_time = None;
+            }
+        }
+
+        // Draw minibuffer prefix and content. This occurs regardless of whether a message was just cleared.
         execute!(
             stdout,
             MoveTo(0, minibuffer_start_y),
@@ -706,7 +844,7 @@ impl Editor {
 
     fn handle_dired_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Char('j') => {
+            KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(dired) = &mut self.dired {
                     let max_index = dired.entries.len() as u16 + 1;
                     if dired.cursor_pos < max_index {
@@ -714,14 +852,14 @@ impl Editor {
                     }
                 }
             },
-            KeyCode::Char('k') => {
+            KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(dired) = &mut self.dired {
                     if dired.cursor_pos > 0 {
                         dired.cursor_pos -= 1;
                     }
                 }
             },
-            KeyCode::Char('h') => {
+            KeyCode::Char('h') | KeyCode::Left => {
                 if let Some(dired) = &mut self.dired {
                     let current_dir_name = dired.current_path.file_name()
                         .and_then(|name| name.to_str())
@@ -736,7 +874,7 @@ impl Editor {
                 }
             },
 
-            KeyCode::Char('l') | KeyCode::Enter => {
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                 if let Some(dired) = &mut self.dired {
                     if dired.cursor_pos == 0 {
                         // Do nothing for '.'
@@ -833,72 +971,117 @@ impl Editor {
             }
 
             KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.show_line_numbers = !self.show_line_numbers;
+            }
+
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.show_fringe = !self.show_fringe;
+            }
+
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => {
+                if let Some(fzy) = &mut self.fzy {
+                    if !fzy.m_x_active {
+                        fzy.m_x_active = true;
+                        fzy.active = true;
+                        fzy.input.clear();
+                        fzy.update_items();
+                        fzy.recalculate_positions();
+                        self.minibuffer_height = fzy.calculate_minibuffer_height(fzy.max_visible_lines) as u16;
+                    }
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('G'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.cursor_pos.1 = self.buffer.len() as u16 - 1; // Move to the last line
+                let last_line_len = self.buffer.last().map_or(0, |line| line.len());
+                self.cursor_pos.0 = last_line_len as u16; // Move to the end of the last line
+                let (_, height) = size()?;
+                let visible_lines = height - self.minibuffer_height - 1; // Account for modeline
+                if self.buffer.len() as u16 > visible_lines {
+                    self.offset.1 = self.buffer.len() as u16 - visible_lines;
+                }
+            },
+            KeyEvent {
+                code: KeyCode::Char('O'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.open_above();
+            },
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.kill_line();
+            },
+
+            KeyEvent {
                 code,
                 modifiers: KeyModifiers::NONE,
                 ..
             } => match code {
+                KeyCode::Backspace => {
+                    self.backspace();
+                },
                 KeyCode::Char('f') => {
                     if let Some(fzy) = &mut self.fzy {
                         // fzy.current_path = self.current_file_path.parent().unwrap().to_path_buf(); // TODO
                         fzy.active = true;
                         fzy.input.clear();
                         fzy.update_items();
+                        fzy.recalculate_positions();
                         self.minibuffer_height = fzy.calculate_minibuffer_height(fzy.max_visible_lines) as u16;
                     }
                 },
-
-                KeyCode::Char('s') => {
-                    self.buffer_save()?;
+                KeyCode::Char('0') => {
+                    self.cursor_pos.0 = 0;
+                },
+                KeyCode::Char('p') => {
+                    self.paste();
+                },
+                KeyCode::Char('o') => {
+                    self.open_below();
+                },
+                KeyCode::Char('g') => {
+                    self.cursor_pos.0 = 0;
+                    self.cursor_pos.1 = 0;
+                    self.offset.0 = 0;
+                    self.offset.1 = 0;
                 },
                 KeyCode::Char('i') => {
                     self.mode = Mode::Insert;
                     self.set_cursor_shape();
                 },
-
                 KeyCode::Char('d') => {
                     self.dired_jump();
                 },
-
-                KeyCode::Char('j') => {
-                    if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
-                        self.cursor_pos.1 += 1;
-                        let next_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
-                        if self.cursor_pos.0 > next_line_len {
-                            self.cursor_pos.0 = next_line_len;
-                        }
-
-                        let (_, height) = size()?;
-                        let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
-
-                        // Adjust offset if cursor moves beyond the last line of the text area
-                        if self.cursor_pos.1 >= self.offset.1 + text_area_height {
-                            self.offset.1 += 1;
-                        }
-                    }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.down();
                 },
-                KeyCode::Char('k') => {
-                    if self.cursor_pos.1 > 0 {
-                        self.cursor_pos.1 -= 1;
-
-                        let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
-                        if self.cursor_pos.0 > prev_line_len {
-                            self.cursor_pos.0 = prev_line_len;
-                        }
-
-                        if self.cursor_pos.1 < self.offset.1 {
-                            self.offset.1 = self.offset.1.saturating_sub(1);
-                        }
-                    }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.up();
                 },
-                KeyCode::Char('h') => {
-                    if self.cursor_pos.0 > 0 {
-                        self.cursor_pos.0 -= 1;
-                    }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.left();
                 },
-                KeyCode::Char('l') => {
-                    if self.cursor_pos.0 < self.buffer[self.cursor_pos.1 as usize].len() as u16 {
-                        self.cursor_pos.0 += 1;
-                    }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    self.right();
                 },
                 KeyCode::Char('q') => {
                     disable_raw_mode()?;
@@ -913,31 +1096,65 @@ impl Editor {
         Ok(())
     }
 
-
     fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                self.set_cursor_shape();
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.paste();
             },
-            KeyCode::Char(c) => {
-                self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
-                self.cursor_pos.0 += 1;
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.down();
             },
-            KeyCode::Backspace => {
-                if self.cursor_pos.0 > 0 {
-                    self.buffer[self.cursor_pos.1 as usize].remove((self.cursor_pos.0 - 1) as usize);
-                    self.cursor_pos.0 -= 1;
-                } else if self.cursor_pos.1 > 0 {
-                    // Handle removing an entire line and moving up
-                    let current_line = self.buffer.remove(self.cursor_pos.1 as usize);
-                    self.cursor_pos.1 -= 1;
-                    self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16;
-                    self.buffer[self.cursor_pos.1 as usize].extend(current_line);
-                }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.up();
             },
-            KeyCode::Enter => {
-                self.enter();
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.left();
+            },
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.right();
+            },
+
+
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => match code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.set_cursor_shape();
+                },
+                KeyCode::Char(c) => {
+                    self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
+                    self.cursor_pos.0 += 1;
+                },
+                KeyCode::Backspace => {
+                    self.backspace();
+                },
+                KeyCode::Enter => {
+                    self.enter();
+                },
+                _ => {}
             },
             _ => {}
         }
@@ -1085,6 +1302,21 @@ fn hex_to_rgb(hex: &str) -> std::result::Result<Color, &'static str> {
     }
 }
 
+macro_rules! register_command {
+    ($commands:expr, $name:expr, $func:expr) => {
+        $commands.insert(
+            $name.to_string(),
+            Box::new(move |editor: &mut Editor| {
+                // Call the function, and wrap non-Result returning functions with Ok(())
+                $func(editor);
+                Ok(())
+            }) as Box<dyn FnMut(&mut Editor) -> io::Result<()>>
+        );
+    };
+}
+
+// TODO command filterning, fuzzy matching highlight,
+//  change colors on selction
 
 struct Fzy {
     active: bool,
@@ -1096,10 +1328,15 @@ struct Fzy {
     initial_input_line_y: Option<u16>,
     initial_items_start_y: Option<u16>,
     initial_positioning_done: bool,
+    m_x_active: bool,
+    commands: HashMap<String, Box<dyn FnMut(&mut Editor) -> io::Result<()>>>,
 }
 
 impl Fzy {
     fn new(current_path: PathBuf) -> Self {
+        let mut commands: HashMap<String, Box<dyn FnMut(&mut Editor) -> io::Result<()>>> = HashMap::new();
+        register_command!(commands, "save-buffer", Editor::buffer_save);
+        register_command!(commands, "dired-jump", Editor::dired_jump);
         Fzy {
             active: false,
             items: Vec::new(),
@@ -1110,39 +1347,49 @@ impl Fzy {
             initial_input_line_y: None,
             initial_items_start_y: None,
             initial_positioning_done: false,
+            m_x_active: false,
+            commands,
         }
     }
 
     fn update_items(&mut self) {
-        let mut entries = vec![".".to_string(), "..".to_string()];
-        let dir_entries = std::fs::read_dir(&self.current_path)
-            .unwrap()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                let file_name = path.file_name()?.to_str()?.to_owned();
+        // Clear existing items to prepare for new items
+        self.items.clear();
 
-                // Skip '.' and '..' as they are already added.
-                if file_name == "." || file_name == ".." {
-                    return None;
-                }
+        if self.m_x_active {
+            self.items.extend(self.commands.keys().cloned());
+        } else {
+            let mut entries = vec![".".to_string(), "..".to_string()];
+            let dir_entries = std::fs::read_dir(&self.current_path)
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let path = entry.path();
+                    let file_name = path.file_name()?.to_str()?.to_owned();
 
-                // Add file if it matches the input filter.
-                if self.input.is_empty() || file_name.contains(&self.input) {
-                    Some(file_name)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<String>>();
+                    // Skip '.' and '..' as they are already added.
+                    if file_name == "." || file_name == ".." {
+                        return None;
+                    }
 
-        entries.extend(dir_entries);
+                    // Add file if it matches the input filter.
+                    if self.input.is_empty() || file_name.contains(&self.input) {
+                        Some(file_name)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<String>>();
 
-        if !self.input.is_empty() {
-            entries.retain(|entry| entry.contains(&self.input));
+            entries.extend(dir_entries);
+
+            if !self.input.is_empty() {
+                entries.retain(|entry| entry.contains(&self.input));
+            }
+
+            self.items = entries;
         }
 
-        self.items = entries;
         self.selection_index = 0; // Reset selection index on each update
     }
 
@@ -1183,15 +1430,19 @@ impl Fzy {
             let is_dir = item == "." || item == ".." || self.current_path.join(item).is_dir();
             let formatted_item = if is_dir { format!("{}/", item) } else { item.clone() };
 
-            let (icon, icon_color) = match item.as_str() {
-                ".." => ("󱚁", theme.text_color),
-                "." => ("󰉋", theme.text_color),
-                ".git" => ("", theme.text_color),
-                _ if item.ends_with(".rs") => ("", hex_to_rgb("#DEA584").unwrap()),
-                _ if item.ends_with(".lock") => ("󰌾", theme.text_color), 
-                _ if item.ends_with(".toml") => ("", theme.text_color),
-                _ if item.ends_with(".json") => ("", hex_to_rgb("#CBCB41").unwrap()),
-                _ => ("󰈚", theme.text_color), // Default icon for files
+            let (icon, icon_color) = if self.m_x_active {
+                ("", theme.text_color)
+            } else {
+                match item.as_str() {
+                    ".." => ("󱚁", theme.text_color),
+                    "." => ("󰉋", theme.text_color),
+                    ".git" => ("", theme.text_color),
+                    _ if item.ends_with(".rs") => ("", hex_to_rgb("#DEA584").unwrap()),
+                    _ if item.ends_with(".lock") => ("󰌾", theme.text_color), 
+                    _ if item.ends_with(".toml") => ("", theme.text_color),
+                    _ if item.ends_with(".json") => ("", hex_to_rgb("#CBCB41").unwrap()),
+                    _ => ("󰈚", theme.text_color), // Default icon for files
+                }
             };
 
             if index == self.selection_index {
@@ -1222,6 +1473,13 @@ impl Fzy {
         execute!(stdout, MoveTo(0, height - 1))?;
         Ok(())
     }
+
+    fn recalculate_positions(&mut self) {
+        let items_to_display = self.items.len().min(self.max_visible_lines);
+        self.initial_input_line_y = Some(terminal::size().unwrap().1.saturating_sub(items_to_display as u16 + 1));
+        self.initial_items_start_y = Some(self.initial_input_line_y.unwrap().saturating_add(1));
+    }
+
     
     pub fn handle_input(&mut self, key: KeyEvent, editor: &mut Editor) -> bool {
         let mut state_changed = false;
@@ -1271,6 +1529,7 @@ impl Fzy {
                     }
                 },
                 KeyCode::Esc => {
+                    self.m_x_active = false;
                     self.active = false;
                     self.input.clear();
                     self.items.clear();
@@ -1278,8 +1537,25 @@ impl Fzy {
                 },
                 KeyCode::Enter => {
                     if let Some(item) = self.items.get(self.selection_index) {
-                        let full_path = self.current_path.join(item);
-                        editor.open(&full_path, None);
+                        if self.m_x_active {
+                            // Check if the selected item is a command
+                            if let Some(command) = self.commands.get_mut(item) {
+                                // Execute the command
+                                let result = command(editor);
+                                if let Err(e) = result {
+                                    // TODO message handle the error
+                                }
+                            }
+                            self.m_x_active = false; // Reset command mode
+                        } else {
+                            // File selection logic
+                            let full_path = self.current_path.join(item);
+                            if let Err(e) = editor.open(&full_path, None) {
+                                // Handle potential error from opening a file
+                                println!("Error opening file: {}", e);
+                            }
+                        }
+                        // Reset Fzy state
                         self.active = false;
                         self.input.clear();
                         self.items.clear();
@@ -1294,4 +1570,3 @@ impl Fzy {
         state_changed // Return whether the fuzzy finder's state has changed
     }
 }
-

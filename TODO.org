@@ -1,0 +1,5 @@
+* Editor
+Can't insert capital letters both in the buffer and in fzy works in the minibuffer []
+Each buffer should hold its cursor position []
+
+
