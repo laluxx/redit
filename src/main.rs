@@ -17,18 +17,18 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 
-use std::time::{Instant, Duration};
+use std::time::Duration;
 
 // TODO Syntax highlighting
 // extern crate tree_sitter;
 // extern crate tree_sitter_rust;
-
 
 #[derive(PartialEq)]
 enum Mode {
     Normal,
     Insert,
     Dired,
+    Visual,
 }
 
 struct Dired {
@@ -263,14 +263,17 @@ struct Editor {
     last_message_time: Option<std::time::Instant>,
     clipboard: String,
     searching: bool,
+    highlight_search: bool,
     search_query: String,
+    selection_start: Option<(u16, u16)>,
+    selection_end: Option<(u16, u16)>,
 }
 
 impl Editor {
     fn new() -> Editor {
         let mut themes = HashMap::new();
         themes.insert("nature".to_string(), Theme::nature());
-        themes.insert("everforest".to_string(), Theme::everforest_medium());
+        themes.insert("doom-one".to_string(), Theme::doom_one());
         let initial_theme_name = "nature".to_string();
         let current_path = env::current_dir().unwrap();
 
@@ -296,7 +299,10 @@ impl Editor {
             last_message_time: None,
             clipboard: String::new(),
             searching: false,
+            highlight_search: false,
             search_query: String::new(),
+            selection_start: None,
+            selection_end: None,
         }
     }
 
@@ -345,6 +351,20 @@ impl Editor {
         }
     }
 
+    fn delete_char(&mut self) {
+        if !self.buffer[self.cursor_pos.1 as usize].is_empty() {
+            if self.cursor_pos.0 < self.buffer[self.cursor_pos.1 as usize].len() as u16 {
+                let removed_char = self.buffer[self.cursor_pos.1 as usize].remove(self.cursor_pos.0 as usize);
+                self.clipboard = removed_char.to_string();
+            }
+        } else if self.buffer.len() > 1 {
+            self.buffer.remove(self.cursor_pos.1 as usize);
+            // An empty line is removed
+            self.clipboard.clear();
+        }
+    }
+
+
     fn up(&mut self) {
         if self.cursor_pos.1 > 0 {
             self.cursor_pos.1 -= 1;
@@ -390,7 +410,6 @@ impl Editor {
         }
     }
 
-    // TODO doesnt work above 
     fn adjust_view_to_cursor(&mut self) {
         let (_, height) = terminal::size().unwrap();
         let text_area_height = height - self.minibuffer_height - 1;
@@ -400,6 +419,130 @@ impl Editor {
         }
         else if self.cursor_pos.1 >= (self.offset.1 + text_area_height) {
             self.offset.1 = self.cursor_pos.1 - text_area_height + 1;
+        }
+    }
+
+    fn search_next(&mut self) {
+        let mut found = false;
+        let (orig_line, orig_col) = (self.cursor_pos.1 as usize, self.cursor_pos.0 as usize);
+        let mut line_idx = orig_line;
+        let mut col_idx = orig_col + 1; // Start searching after the current cursor position
+
+        loop {
+            if line_idx >= self.buffer.len() {
+                // Wrap to the beginning of the document
+                line_idx = 0;
+                col_idx = 0;
+            }
+
+            if let Some(line) = self.buffer.get(line_idx) {
+                if let Some(match_idx) = line.iter().skip(col_idx).collect::<String>().find(&self.search_query) {
+                    self.cursor_pos = (match_idx as u16 + col_idx as u16, line_idx as u16);
+                    found = true;
+                    break;
+                }
+            }
+
+            // Move to the next line from the start
+            line_idx += 1;
+            col_idx = 0;
+
+            // Stop if we've wrapped around to the original position
+            if line_idx == orig_line && col_idx >= orig_col {
+                break;
+            }
+        }
+
+        if !found {
+            self.message("Search query not found.");
+        } else {
+            self.adjust_view_to_cursor();
+        }
+    }
+
+    fn search_previous(&mut self) {
+        let mut found = false;
+        let (orig_line, orig_col) = (self.cursor_pos.1 as usize, if self.cursor_pos.0 > 0 { self.cursor_pos.0 as usize - 1 } else { usize::MAX });
+        let mut line_idx = if orig_line == 0 { self.buffer.len() - 1 } else { orig_line - 1 };
+        let mut col_idx = if orig_col == usize::MAX { self.buffer.get(line_idx).map_or(0, |l| l.len()) } else { orig_col };
+
+        loop {
+            if let Some(line) = self.buffer.get(line_idx) {
+                let search_str: String = line.iter().take(col_idx).collect();
+                if let Some(match_idx) = search_str.rfind(&self.search_query) {
+                    self.cursor_pos = (match_idx as u16, line_idx as u16);
+                    found = true;
+                    break;
+                }
+            }
+
+            if line_idx == 0 {
+                // Wrap to the end of the document
+                line_idx = self.buffer.len() - 1;
+                col_idx = self.buffer.get(line_idx).map_or(0, |l| l.len());
+            } else {
+                line_idx -= 1;
+                col_idx = self.buffer.get(line_idx).map_or(0, |l| l.len());
+            }
+
+            // Stop if we've wrapped around to the original position
+            if line_idx == orig_line && col_idx <= orig_col {
+                break;
+            }
+        }
+
+        if !found {
+            self.message("Search query not found.");
+        } else {
+            self.adjust_view_to_cursor();
+        }
+    }
+
+    fn delete_selection(&mut self) {
+        if let (Some(mut start), Some(mut end)) = (self.selection_start, self.selection_end) {
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+
+            if (end.0 as usize) < self.buffer[end.1 as usize].len() {
+                end.0 += 1;
+            } else if (end.1 as usize) + 1 < self.buffer.len() {
+                end.1 += 1;
+                end.0 = 0;
+            }
+
+            let mut deleted_text = String::new();
+
+            if start.1 == end.1 {
+                let line = &mut self.buffer[start.1 as usize];
+                if (start.0 as usize) < line.len() {
+                    deleted_text = line.drain((start.0 as usize)..(end.0 as usize)).collect();
+                }
+            } else {
+                let start_line = &mut self.buffer[start.1 as usize];
+                deleted_text.extend(start_line.drain((start.0 as usize)..));
+
+                for line_idx in ((start.1 as usize + 1)..(end.1 as usize)).rev() {
+                    deleted_text.push('\n');
+                    deleted_text.extend(self.buffer.remove(line_idx));
+                }
+
+                if (end.0 > 0) && ((start.1 as usize) + 1 == end.1 as usize) {
+                    let end_line = &mut self.buffer[start.1 as usize + 1];
+                    deleted_text.push('\n');
+                    deleted_text.extend(end_line.drain(..(end.0 as usize)));
+                }
+
+                if start.1 != end.1 && !self.buffer[start.1 as usize].is_empty() && !self.buffer[start.1 as usize + 1].is_empty() {
+                    let remaining = self.buffer.remove(start.1 as usize + 1);
+                    self.buffer[start.1 as usize].extend(remaining);
+                }
+            }
+
+            self.clipboard = deleted_text;
+            self.cursor_pos = start;
+            self.selection_start = None;
+            self.selection_end = None;
         }
     }
     
@@ -464,7 +607,7 @@ impl Editor {
                 // If the cursor is at the end of the line or the line is empty, remove the line
                 if self.cursor_pos.1 as usize != self.buffer.len() - 1 {
                     self.buffer.remove(self.cursor_pos.1 as usize);
-                    // Consider adding an empty string to the clipboard or handling differently
+                    // Adding an empty string to the clipboard
                     self.clipboard.clear();
                 }
             }
@@ -500,6 +643,51 @@ impl Editor {
             eprintln!("Error opening directory: {}", e);
         }
     }
+
+    fn draw_selection(&self, stdout: &mut io::Stdout) -> Result<()> {
+        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
+            let selection_color = self.current_theme().selection_color;
+
+            // Ensure start is before end
+            let (start, end) = if start > end { (end, start) } else { (start, end) };
+
+            // Calculate the starting column base considering fringe and line numbers
+            let mut start_col_base = 0;
+            if self.show_fringe {
+                start_col_base += 2; // Account for fringe width
+            }
+            if self.show_line_numbers {
+                start_col_base += 4; // Account for space for line numbers
+            }
+
+            for line_idx in start.1..=end.1 {
+                let line_y = line_idx.saturating_sub(self.offset.1) as u16; // Adjust Y position based on the current offset
+                if let Some(line) = self.buffer.get(line_idx as usize) {
+                    let start_col = if line_idx == start.1 { start.0 as usize } else { 0 };
+                    let end_col = if line_idx == end.1 { end.0 as usize + 1 } else { line.len() }; // +1 to include the end character, ensure it does not exceed line length
+
+                    // Convert the line segment to a String
+                    let line_content: String = line.iter().collect::<String>();
+                    let selection_content = &line_content[start_col..end_col];
+
+                    // Calculate the X position for the start of the selection
+                    let selection_start_x = start_col_base + start_col as u16;
+
+                    // Draw the selection background for the selected text
+                    execute!(
+                        stdout,
+                        MoveTo(selection_start_x, line_y),
+                        SetBackgroundColor(selection_color),
+                        Print(selection_content),
+                        ResetColor
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     
     fn draw(&mut self, stdout: &mut Stdout) -> Result<()> {
         let (width, height) = terminal::size()?;
@@ -546,6 +734,7 @@ impl Editor {
                 self.draw_line_numbers(stdout, height, start_col)?;
             }
             self.draw_text(stdout)?;
+            self.draw_selection(stdout)?;
         }
 
         let cursor_pos = if self.minibuffer_active {
@@ -587,39 +776,8 @@ impl Editor {
         Ok(())
     }
 
-    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-    //     let (width, height) = size()?; // TODO Horizzonatl scroll
-    //     let text_color = self.current_theme().text_color;
-    //     let mut start_col = 0;
-
-    //     if self.show_fringe {
-    //         start_col += 2; // Fringe width
-    //     }
-
-    //     if self.show_line_numbers {
-    //         start_col += 4; // Space for line numbers
-    //     }
-
-    //     execute!(stdout, SetForegroundColor(text_color))?; // Set the text color
-    //     let bottom_exclude = self.minibuffer_height + 1; // Calculate area to exclude
-
-    //     for (idx, line) in self.buffer.iter().enumerate() {
-    //         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-    //             let line_content: String = line.iter().collect();
-    //             execute!(
-    //                 stdout,
-    //                 MoveTo(start_col, (idx - self.offset.1 as usize) as u16),
-    //                 Print(line_content)
-    //             )?;
-    //         }
-    //     }
-
-    //     Ok(())
-    // }
-
-        
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-        let (width, height) = size()?; // TODO Horizzonatl scroll
+        let (width, height) = size()?; // Assuming size() is a function that returns the current terminal size
         let text_color = self.current_theme().text_color;
         let search_bg_color = self.current_theme().search_bg_color;
         let background_color = self.current_theme().background_color;
@@ -630,39 +788,39 @@ impl Editor {
         }
 
         if self.show_line_numbers {
-            start_col_base += 4; // Space for line numbers
+            start_col_base += 4; // Account for space for line numbers
         }
 
-        let bottom_exclude = self.minibuffer_height + 1; // Bottom area to exclude (minibuffer)
+        let bottom_exclude = self.minibuffer_height + 1;
+        let search_string = if self.minibuffer_active {
+            &self.minibuffer_content
+        } else {
+            &self.search_query
+        };
 
         for (idx, line) in self.buffer.iter().enumerate() {
             if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
                 let line_content: String = line.iter().collect();
                 let line_y = (idx - self.offset.1 as usize) as u16;
 
-                if self.searching && !self.minibuffer_content.is_empty() {
-                    // Split and highlight search matches
+                if self.highlight_search && !search_string.is_empty() {
                     let mut current_col = start_col_base;
                     let mut last_index = 0;
 
-                    for (start, part) in line_content.match_indices(&self.minibuffer_content) {
-                        // Print preceding text
+                    for (start, part) in line_content.match_indices(search_string) {
                         let preceding_text = &line_content[last_index..start];
                         execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(preceding_text))?;
                         current_col += preceding_text.len() as u16;
 
-                        // Highlight match
                         execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(search_bg_color), Print(part))?;
                         current_col += part.len() as u16;
 
                         last_index = start + part.len();
                     }
 
-                    // Print trailing text
                     let trailing_text = &line_content[last_index..];
                     execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(trailing_text))?;
                 } else {
-                    // Print line normally if not searching or no search term is provided
                     execute!(stdout, MoveTo(start_col_base, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(line_content))?;
                 }
             }
@@ -672,7 +830,7 @@ impl Editor {
     }
 
 
-
+        
         
     // TODO ~ after the last line 3 options only one, none or untile the end
     fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
@@ -744,6 +902,7 @@ impl Editor {
             Mode::Normal => ("NORMAL", self.current_theme().normal_cursor_color, Color::Black),
             Mode::Insert => ("INSERT", self.current_theme().insert_cursor_color, Color::Black),
             Mode::Dired => ("DIRED", self.current_theme().dired_mode_color, Color::Black),
+            Mode::Visual => ("VISUAL", self.current_theme().visual_mode_color, Color::Black),
         };
 
         let file_bg_color = self.current_theme().modeline_lighter_color;
@@ -949,6 +1108,7 @@ impl Editor {
                         Mode::Normal => self.handle_normal_mode(key)?,
                         Mode::Insert => self.handle_insert_mode(key)?,
                         Mode::Dired => self.handle_dired_mode(key)?,
+                        Mode::Visual => self.handle_visual_mode(key)?,
                     }
                 }
             }
@@ -960,7 +1120,7 @@ impl Editor {
         let line = "\x1b[6 q";
 
         let shape = match self.mode {
-            Mode::Normal | Mode::Dired => block,
+            Mode::Normal | Mode::Dired | Mode::Visual => block,
             Mode::Insert => if self.insert_line_cursor { line } else { block },
         };
 
@@ -1117,7 +1277,26 @@ impl Editor {
             } => {
                 self.show_fringe = !self.show_fringe;
             }
-
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                // Check if there's an existing search query and display it as a message
+                if !self.search_query.is_empty() {
+                    self.message(&format!("Search query: {}", self.search_query));
+                } else {
+                    self.message("No search query.");
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('N'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.highlight_search = true;
+                self.search_previous();
+            }
             KeyEvent {
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::ALT,
@@ -1169,6 +1348,14 @@ impl Editor {
             } => {
                 self.join();
             },
+            KeyEvent {
+                code: KeyCode::Char('A'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+                self.mode = Mode::Insert;
+            },
 
             KeyEvent {
                 code,
@@ -1190,17 +1377,38 @@ impl Editor {
                 },
                 KeyCode::Char('/') => {
                     self.searching = true;
+                    self.highlight_search = true;
                     self.minibuffer_active = true;
                     self.minibuffer_prefix = "Search:".to_string();
                 },
+                KeyCode::Char('n') => {
+                    self.highlight_search = true;
+                    self.search_next();
+                },
+                KeyCode::Esc => {
+                    self.highlight_search = false;
+                },
                 KeyCode::Char('0') => {
                     self.cursor_pos.0 = 0;
+                },
+                KeyCode::Char('x') => {
+                    self.delete_char()
                 },
                 KeyCode::Char('p') => {
                     self.paste();
                 },
                 KeyCode::Char('o') => {
                     self.open_below();
+                },
+                KeyCode::Char('a') => {
+                    self.right();
+                    self.mode = Mode::Insert;
+                },
+                KeyCode::Char('v') => {
+                    // TODO clamp the cursor position
+                    self.mode = Mode::Visual;
+                    self.selection_start = Some(self.cursor_pos);
+                    self.selection_end = Some(self.cursor_pos);
                 },
                 KeyCode::Char('g') => {
                     self.cursor_pos.0 = 0;
@@ -1240,6 +1448,60 @@ impl Editor {
         Ok(())
     }
 
+    fn handle_visual_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.set_cursor_shape();
+                self.selection_start = None;
+                self.selection_end = None;
+            },
+            KeyCode::Char('v') => {
+                self.mode = Mode::Normal;
+                self.selection_start = None;
+                self.selection_end = None;
+            },
+            KeyCode::Char('x') => {
+                self.delete_selection();
+                self.mode = Mode::Normal;
+                self.selection_start = None;
+                self.selection_end = None;
+            },
+            KeyCode::Char('h') | KeyCode::Left => {
+                if self.cursor_pos.0 > 0 {
+                    self.cursor_pos.0 -= 1;
+                }
+            },
+            KeyCode::Char('l') | KeyCode::Right => {
+                // Prevent moving into the newline character at the end of lines
+                let line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+                if self.cursor_pos.0 < line_len.saturating_sub(1) {
+                    self.cursor_pos.0 += 1;
+                }
+            },
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
+                    self.cursor_pos.1 += 1;
+                    // Adjust for potentially shorter next line
+                    self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
+                }
+            },
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.cursor_pos.1 > 0 {
+                    self.cursor_pos.1 -= 1;
+                    // Adjust for potentially shorter previous line
+                    self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
+                }
+            },
+            _ => {}
+        };
+
+        // Update the selection end after movement, ensuring it's within valid text regions
+        self.selection_end = Some(self.cursor_pos);
+
+        Ok(())
+    }
+
     fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key {
             KeyEvent {
@@ -1268,7 +1530,7 @@ impl Editor {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.left();
+                self.backspace();
             },
             KeyEvent {
                 code: KeyCode::Char('l'),
@@ -1277,8 +1539,15 @@ impl Editor {
             } => {
                 self.right();
             },
-
-
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.searching = true;
+                self.minibuffer_active = true;
+                self.minibuffer_prefix = "Search:".to_string();
+            },
             KeyEvent {
                 code,
                 modifiers: KeyModifiers::NONE,
@@ -1328,6 +1597,8 @@ struct Theme {
     error_color: Color,
     ok_color: Color,
     search_bg_color: Color,
+    visual_mode_color: Color,
+    selection_color: Color,
 }
 
 impl Theme {
@@ -1353,31 +1624,35 @@ impl Theme {
             error_color: hex_to_rgb("#444E46").unwrap(),
             ok_color: hex_to_rgb("#4C6750").unwrap(),
             search_bg_color: hex_to_rgb("#3B5238").unwrap(),
+            visual_mode_color: hex_to_rgb("#3B5238").unwrap(),
+            selection_color: hex_to_rgb("#262626").unwrap(),
         }
     }
 
-    fn everforest_medium() -> Self {
+    fn doom_one() -> Self {
         Theme {
-            background_color: hex_to_rgb("#2D353B").unwrap(),
-            text_color: hex_to_rgb("#D3C6AA").unwrap(),
-            normal_cursor_color: hex_to_rgb("#A7C080").unwrap(), 
-            insert_cursor_color: hex_to_rgb("#E67E80").unwrap(), 
-            fringe_color: hex_to_rgb("#2D353B").unwrap(), 
-            line_numbers_color: hex_to_rgb("#3D484D").unwrap(), 
-            current_line_number_color: hex_to_rgb("#A7C080").unwrap(), 
-            modeline_color: hex_to_rgb("#3D484D").unwrap(), 
-            modeline_lighter_color: hex_to_rgb("#475258").unwrap(), 
-            minibuffer_color: hex_to_rgb("#232A2E").unwrap(), 
-            dired_mode_color: hex_to_rgb("#D699B6").unwrap(), 
-            dired_timestamp_color: hex_to_rgb("#D699B6").unwrap(), 
-            dired_path_color: hex_to_rgb("#A7C080").unwrap(), 
-            dired_size_color: hex_to_rgb("#3D484D").unwrap(), 
-            dired_dir_color: hex_to_rgb("#A7C080").unwrap(), 
-            comment_color: hex_to_rgb("#3D484D").unwrap(), 
-            warning_color: hex_to_rgb("#DBBC7F").unwrap(), 
-            error_color: hex_to_rgb("#E67E80").unwrap(), 
-            ok_color: hex_to_rgb("#A7C080").unwrap(), 
-            search_bg_color: hex_to_rgb("#E67E80").unwrap(),
+            background_color: hex_to_rgb("#282C34").unwrap(),
+            text_color: hex_to_rgb("#BBC2CF").unwrap(),
+            normal_cursor_color: hex_to_rgb("#51AFEF").unwrap(), 
+            insert_cursor_color: hex_to_rgb("#A9A1E1").unwrap(), 
+            fringe_color: hex_to_rgb("#282C34").unwrap(), 
+            line_numbers_color: hex_to_rgb("#3F444A").unwrap(), 
+            current_line_number_color: hex_to_rgb("#BBC2CF").unwrap(), 
+            modeline_color: hex_to_rgb("#1D2026").unwrap(), 
+            modeline_lighter_color: hex_to_rgb("#252931").unwrap(), 
+            minibuffer_color: hex_to_rgb("#21242B").unwrap(), 
+            dired_mode_color: hex_to_rgb("#ECBE7B").unwrap(), 
+            dired_timestamp_color: hex_to_rgb("#46D9FC").unwrap(), 
+            dired_path_color: hex_to_rgb("#51AFEF").unwrap(), 
+            dired_size_color: hex_to_rgb("#DA8548").unwrap(), 
+            dired_dir_color: hex_to_rgb("#C678DD").unwrap(), 
+            comment_color: hex_to_rgb("#5B6268").unwrap(), 
+            warning_color: hex_to_rgb("#ECBE7B").unwrap(), 
+            error_color: hex_to_rgb("#FF6C6B").unwrap(), 
+            ok_color: hex_to_rgb("#98BE65").unwrap(), 
+            search_bg_color: hex_to_rgb("#387AA7").unwrap(),
+            visual_mode_color: hex_to_rgb("#C678DD").unwrap(),
+            selection_color: hex_to_rgb("#42444A").unwrap(),
         }
     }
 
@@ -1405,6 +1680,7 @@ impl Theme {
                 Mode::Normal => &self.normal_cursor_color,
                 Mode::Insert => &self.insert_cursor_color,
                 Mode::Dired => &self.normal_cursor_color,
+                Mode::Visual => &self.normal_cursor_color,
             }
         };
 

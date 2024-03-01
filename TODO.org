@@ -1,5 +1,6 @@
 * Editor
 Can't insert capital letters both in the buffer and in fzy works in the minibuffer []
 Each buffer should hold its cursor position []
+Dired not working as expected when using as "redit main.rs" []
 
 
