@@ -246,6 +246,8 @@ struct Editor {
     dired: Option<Dired>,
     cursor_pos: (u16, u16),
     offset: (u16, u16),
+    top_scroll_margin: u16,
+    bottom_scroll_margin: u16,
     buffer: Vec<Vec<char>>,
     themes: HashMap<String, Theme>,
     current_theme_name: String,
@@ -267,6 +269,7 @@ struct Editor {
     search_query: String,
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
+    copied_line: bool,
 }
 
 impl Editor {
@@ -281,6 +284,8 @@ impl Editor {
             mode: Mode::Normal, 
             cursor_pos: (0, 0), 
             offset: (0, 0),
+            top_scroll_margin: 10,
+            bottom_scroll_margin: 10,
             buffer: vec![vec![]],
             themes,
             current_theme_name: initial_theme_name,
@@ -303,6 +308,7 @@ impl Editor {
             search_query: String::new(),
             selection_start: None,
             selection_end: None,
+            copied_line: false,
         }
     }
 
@@ -336,6 +342,23 @@ impl Editor {
         self.buffer.insert(self.cursor_pos.1 as usize + 1, tail);
         self.cursor_pos.1 += 1;
         self.cursor_pos.0 = 0;
+
+        let (_, height) = terminal::size().unwrap();
+        let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
+
+        let effective_text_area_height = text_area_height - self.bottom_scroll_margin;
+
+        if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
+            let max_offset_possible = if self.buffer.len() as u16 > text_area_height {
+                self.buffer.len() as u16 - text_area_height
+            } else {
+                0 // No scrolling needed if the document is shorter than the viewport
+            };
+
+            if self.offset.1 < max_offset_possible {
+                self.offset.1 = (self.offset.1 + 1).min(max_offset_possible); // Safely increment offset
+            }
+        }
     }
 
     fn backspace(&mut self) {
@@ -365,39 +388,85 @@ impl Editor {
     }
 
 
+    // TODO CrossTerm don't support ctrl+backspace
+    fn backward_kill_word(&mut self) {
+        if self.cursor_pos.1 == 0 && self.cursor_pos.0 == 0 {
+            return;
+        }
+
+        let line_idx = self.cursor_pos.1 as usize;
+        let mut char_idx = self.cursor_pos.0 as usize;
+        let line = &mut self.buffer[line_idx];
+
+        if char_idx == 0 {
+            if line_idx > 0 {
+                self.cursor_pos.1 -= 1;
+                let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+                self.cursor_pos.0 = prev_line_len;
+            }
+            return;
+        }
+
+        let mut word_start = 0;
+        let mut found_non_whitespace = false;
+        for (i, &c) in line[..char_idx].iter().enumerate().rev() {
+            if c.is_whitespace() {
+                if found_non_whitespace {
+                    word_start = i + 1;
+                    break;
+                }
+            } else {
+                found_non_whitespace = true;
+            }
+        }
+
+        let removed = line.drain(word_start..char_idx).collect::<String>();
+        self.clipboard = removed; // Optionally, store the deleted text in the clipboard.
+        self.cursor_pos.0 = word_start as u16;
+    }
+    
+
     fn up(&mut self) {
         if self.cursor_pos.1 > 0 {
             self.cursor_pos.1 -= 1;
 
+            // Adjust cursor position if it exceeds the length of the new line
             let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
             if self.cursor_pos.0 > prev_line_len {
                 self.cursor_pos.0 = prev_line_len;
             }
 
-            if self.cursor_pos.1 < self.offset.1 {
-                self.offset.1 = self.offset.1.saturating_sub(1);
+            // Top scroll margin
+            if self.cursor_pos.1 < self.offset.1 + self.top_scroll_margin && self.offset.1 > 0 {
+                self.offset.1 -= 1;
             }
         }
     }
 
     fn down(&mut self) {
+        let (_, height) = terminal::size().unwrap();
+        let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
+
         if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
             self.cursor_pos.1 += 1;
+
+            // Adjust cursor position if it exceeds the length of the next line
             let next_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
             if self.cursor_pos.0 > next_line_len {
                 self.cursor_pos.0 = next_line_len;
             }
 
-            let (_, height) = size().unwrap();
-            let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
-
-            // Adjust offset if cursor moves beyond the last line of the text area
-            if self.cursor_pos.1 >= self.offset.1 + text_area_height {
-                self.offset.1 += 1;
+            let effective_text_area_height = text_area_height - self.bottom_scroll_margin;
+            // Adjust offset if cursor moves beyond the last line of the effective text area
+            if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
+                // Only scroll if not at the last document line
+                if self.offset.1 < self.buffer.len() as u16 - text_area_height {
+                    self.offset.1 += 1;
+                }
             }
         }
     }
-
+    
     fn left(&mut self) {
         if self.cursor_pos.0 > 0 {
             self.cursor_pos.0 -= 1;
@@ -410,29 +479,58 @@ impl Editor {
         }
     }
 
-    fn adjust_view_to_cursor(&mut self) {
+    fn adjust_view_to_cursor(&mut self, adjustment: &str) {
         let (_, height) = terminal::size().unwrap();
         let text_area_height = height - self.minibuffer_height - 1;
 
-        if self.cursor_pos.1 < self.offset.1 {
-            self.offset.1 = self.cursor_pos.1;
+        match adjustment {
+            "center" => {
+                let new_offset = self.cursor_pos.1.saturating_sub(text_area_height / 2);
+                self.offset.1 = new_offset;
+            },
+            "enough" => {
+                if self.cursor_pos.1 < self.offset.1 {
+                    self.offset.1 = self.cursor_pos.1;
+                } else if self.cursor_pos.1 >= (self.offset.1 + text_area_height) {
+                    self.offset.1 = self.cursor_pos.1.saturating_sub(text_area_height) + 1;
+                }
+            },
+            _ => {
+                // Default behavior respecting top and bottom scroll margins
+                if self.cursor_pos.1 < self.offset.1 + self.top_scroll_margin {
+                    self.offset.1 = self.cursor_pos.1.saturating_sub(self.top_scroll_margin);
+                } else if self.cursor_pos.1 + self.bottom_scroll_margin >= self.offset.1 + text_area_height {
+                    self.offset.1 = self.cursor_pos.1 + self.bottom_scroll_margin + 1 - text_area_height;
+                }
+            }
         }
-        else if self.cursor_pos.1 >= (self.offset.1 + text_area_height) {
-            self.offset.1 = self.cursor_pos.1 - text_area_height + 1;
+    }
+
+    fn goto_line(&mut self, line_number: usize) {
+        if line_number == 0 || line_number > self.buffer.len() {
+            self.message(&format!("Line number {} doesn't exist.", line_number));
+            return;
         }
+
+        self.cursor_pos.1 = (line_number - 1) as u16; // Convert to 0-based index
+        self.cursor_pos.0 = 0;
+
+        self.adjust_view_to_cursor("center");
     }
 
     fn search_next(&mut self) {
         let mut found = false;
+        let mut wrapped_around = false;
         let (orig_line, orig_col) = (self.cursor_pos.1 as usize, self.cursor_pos.0 as usize);
         let mut line_idx = orig_line;
-        let mut col_idx = orig_col + 1; // Start searching after the current cursor position
+        let mut col_idx = orig_col + 1;
 
         loop {
             if line_idx >= self.buffer.len() {
                 // Wrap to the beginning of the document
                 line_idx = 0;
                 col_idx = 0;
+                wrapped_around = true;
             }
 
             if let Some(line) = self.buffer.get(line_idx) {
@@ -456,12 +554,13 @@ impl Editor {
         if !found {
             self.message("Search query not found.");
         } else {
-            self.adjust_view_to_cursor();
+            self.adjust_view_to_cursor(if wrapped_around { "center" } else { "" });
         }
     }
 
     fn search_previous(&mut self) {
         let mut found = false;
+        let mut wrapped_around = false;
         let (orig_line, orig_col) = (self.cursor_pos.1 as usize, if self.cursor_pos.0 > 0 { self.cursor_pos.0 as usize - 1 } else { usize::MAX });
         let mut line_idx = if orig_line == 0 { self.buffer.len() - 1 } else { orig_line - 1 };
         let mut col_idx = if orig_col == usize::MAX { self.buffer.get(line_idx).map_or(0, |l| l.len()) } else { orig_col };
@@ -480,6 +579,7 @@ impl Editor {
                 // Wrap to the end of the document
                 line_idx = self.buffer.len() - 1;
                 col_idx = self.buffer.get(line_idx).map_or(0, |l| l.len());
+                wrapped_around = true;
             } else {
                 line_idx -= 1;
                 col_idx = self.buffer.get(line_idx).map_or(0, |l| l.len());
@@ -494,10 +594,11 @@ impl Editor {
         if !found {
             self.message("Search query not found.");
         } else {
-            self.adjust_view_to_cursor();
+            self.adjust_view_to_cursor(if wrapped_around { "center" } else { "" });
         }
     }
 
+    
     fn delete_selection(&mut self) {
         if let (Some(mut start), Some(mut end)) = (self.selection_start, self.selection_end) {
             if start > end {
@@ -545,6 +646,57 @@ impl Editor {
             self.selection_end = None;
         }
     }
+
+    fn copy_selection(&mut self) {
+        if let (Some(mut start), Some(mut end)) = (self.selection_start, self.selection_end) {
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+
+            if end.0 < self.buffer[end.1 as usize].len() as u16 {
+                end.0 += 1; // Include the character at the end position
+            } else if end.1 < self.buffer.len() as u16 - 1 {
+                // If at the end of the line, but not the last line, move to the start of the next line
+                end.1 += 1;
+                end.0 = 0;
+            }
+
+            let mut selected_text = String::new();
+
+            for line_idx in start.1..=end.1 {
+                let line = &self.buffer[line_idx as usize];
+                
+                if start.1 == end.1 {
+                    // If selection is within a single line
+                    selected_text.push_str(&line[start.0 as usize..end.0 as usize].iter().collect::<String>());
+                } else {
+                    // If selection spans multiple lines
+                    if line_idx == start.1 {
+                        // First line
+                        selected_text.push_str(&line[start.0 as usize..].iter().collect::<String>());
+                        selected_text.push('\n');
+                    } else if line_idx == end.1 {
+                        // Last line, adjust to not include the newline if end.0 is 0
+                        if end.0 > 0 {
+                            selected_text.push_str(&line[..(end.0 as usize).saturating_sub(1)].iter().collect::<String>());
+                        }
+                    } else {
+                        // Lines in between
+                        selected_text.push_str(&line.iter().collect::<String>());
+                        selected_text.push('\n');
+                    }
+                }
+            }
+
+            self.copied_line = false;
+            self.clipboard = selected_text;
+            self.cursor_pos = start;
+            self.selection_start = None;
+            self.selection_end = None;
+        }
+    }
+
+
     
     fn join(&mut self) {
         if self.cursor_pos.1 as usize + 1 < self.buffer.len() {
@@ -614,16 +766,60 @@ impl Editor {
         }
     }
 
-    fn paste(&mut self) {
-        if let Some(line) = self.buffer.get_mut(self.cursor_pos.1 as usize) {
-            let paste_position = self.cursor_pos.0 as usize;
-            // Split the current line at the cursor, insert the clipboard content, and then the rest of the line
-            let rest_of_line: String = line.drain(paste_position..).collect();
-            let clipboard_content: Vec<char> = self.clipboard.chars().collect();
-            line.extend(clipboard_content);
-            line.extend(rest_of_line.chars());
-            // Move the cursor to the end of the pasted content
-            self.cursor_pos.0 += self.clipboard.chars().count() as u16;
+    fn paste(&mut self, position: &str) {
+        if self.copied_line {
+            let new_line: Vec<char> = self.clipboard.chars().collect();
+            let line_index = match position {
+                "after" => self.cursor_pos.1 as usize + 1, // Paste after the current line
+                _ => self.cursor_pos.1 as usize,           // Default to pasting before if not explicitly "after"
+            };
+            self.buffer.insert(line_index, new_line);
+            self.cursor_pos.1 = line_index as u16;
+            self.cursor_pos.0 = 0;
+        } else {
+            // Adjust for pasting before or after within a line.
+            let line_len = self.buffer[self.cursor_pos.1 as usize].len();
+            let paste_position = if position == "after" && self.cursor_pos.0 as usize == line_len {
+                // When the cursor is at the end of the line.
+                line_len // Use line length directly to append at the end.
+            } else if position == "after" {
+                self.cursor_pos.0 as usize + 1
+            } else {
+                self.cursor_pos.0 as usize
+            };
+
+            if let Some(line) = self.buffer.get_mut(self.cursor_pos.1 as usize) {
+                if position == "after" && self.cursor_pos.0 as usize == line_len {
+                    // Directly extend the line if pasting after at the line's end.
+                    let clipboard_content: Vec<char> = self.clipboard.chars().collect();
+                    line.extend(clipboard_content);
+                } else {
+                    let rest_of_line: String = line.drain(paste_position..).collect();
+                    let clipboard_content: Vec<char> = self.clipboard.chars().collect();
+                    line.extend(clipboard_content);
+                    line.extend(rest_of_line.chars());
+                }
+                self.cursor_pos.0 = if position == "after" && self.cursor_pos.0 as usize == line_len {
+                    (line_len + self.clipboard.chars().count()) as u16
+                } else {
+                    paste_position as u16 + self.clipboard.chars().count() as u16
+                };
+            }
+        }
+
+        // Scroll logic to ensure the cursor is visible after pasting.
+        let (_, height) = terminal::size().unwrap();
+        let text_area_height = height - self.minibuffer_height - 1;
+        let effective_text_area_height = text_area_height - self.bottom_scroll_margin;
+        if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
+            let max_offset_possible = if self.buffer.len() as u16 > text_area_height {
+                self.buffer.len() as u16 - text_area_height
+            } else {
+                0
+            };
+            if self.offset.1 < max_offset_possible {
+                self.offset.1 = (self.offset.1 + 1).min(max_offset_possible);
+            }
         }
     }
 
@@ -777,7 +973,7 @@ impl Editor {
     }
 
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-        let (width, height) = size()?; // Assuming size() is a function that returns the current terminal size
+        let (width, height) = size()?;
         let text_color = self.current_theme().text_color;
         let search_bg_color = self.current_theme().search_bg_color;
         let background_color = self.current_theme().background_color;
@@ -828,11 +1024,9 @@ impl Editor {
 
         Ok(())
     }
-
-
-        
         
     // TODO ~ after the last line 3 options only one, none or untile the end
+    // TODO Option for relative line numbers, add one padding when we reach 4 digits lines numbers
     fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
         if self.show_line_numbers {
             let bottom_exclude = self.minibuffer_height + 1;
@@ -1039,8 +1233,14 @@ impl Editor {
                             let minibuffer_content = std::mem::take(&mut self.minibuffer_content);
                             if self.minibuffer_prefix == "Switch theme:" {
                                 self.switch_theme(&minibuffer_content);
+                            } else if self.minibuffer_prefix == ":" {
+                                if let Ok(line_number) = minibuffer_content.parse::<usize>() {
+                                    self.goto_line(line_number);
+                                } else {
+                                    self.message("Invalid line number.");
+                                }
+
                             } else if self.minibuffer_prefix == "Search:" {
-                                // Copy search query to a persistent variable if needed.
                                 self.search_query = minibuffer_content.clone();
                                 
                                 // Find the next occurrence of the search query from the cursor's current position.
@@ -1065,7 +1265,7 @@ impl Editor {
                                         }
                                     }
                                 }
-                                self.adjust_view_to_cursor();
+                                self.adjust_view_to_cursor("");
                             } else if self.mode == Mode::Dired {
                                 if self.minibuffer_prefix == "Create directory:" {
                                     if let Some(dired) = &mut self.dired {
@@ -1238,11 +1438,10 @@ impl Editor {
     fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key {
             KeyEvent {
-                code: KeyCode::Char('t') | KeyCode::Char('T'),
+                code: KeyCode::Char('t'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                // Activates the minibuffer for theme switching with Ctrl+T
                 self.minibuffer_active = true;
                 self.minibuffer_prefix = "Switch theme:".to_string();
                 self.minibuffer_content = "".to_string();
@@ -1356,6 +1555,13 @@ impl Editor {
                 self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16;
                 self.mode = Mode::Insert;
             },
+            KeyEvent {
+                code: KeyCode::Char('P'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.paste("before");
+            },
 
             KeyEvent {
                 code,
@@ -1394,8 +1600,16 @@ impl Editor {
                 KeyCode::Char('x') => {
                     self.delete_char()
                 },
+                KeyCode::Char('y') => {
+                    if let Some(line) = self.buffer.get(self.cursor_pos.1 as usize) {
+                        let line_text = line.iter().collect::<String>();
+                        self.clipboard = line_text;
+                        self.copied_line = true;
+                        self.message("Line copied to clipboard.");
+                    }
+                },
                 KeyCode::Char('p') => {
-                    self.paste();
+                    self.paste("after");
                 },
                 KeyCode::Char('o') => {
                     self.open_below();
@@ -1419,9 +1633,15 @@ impl Editor {
                 KeyCode::Char('i') => {
                     self.mode = Mode::Insert;
                     self.set_cursor_shape();
+                    // self.message("--INSERT--"); 
                 },
                 KeyCode::Char('d') => {
                     self.dired_jump();
+                },
+                KeyCode::Char(':') => {
+                    self.minibuffer_active = true;
+                    self.minibuffer_prefix = ":".to_string();
+                    self.minibuffer_content = "".to_string();
                 },
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.down();
@@ -1493,6 +1713,14 @@ impl Editor {
                     self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
                 }
             },
+
+            KeyCode::Char('y') => {
+                // TODO Reset cursor to the original position
+                self.copy_selection();
+                self.mode = Mode::Normal;
+                self.selection_start = None;
+                self.selection_end = None;
+            },
             _ => {}
         };
 
@@ -1509,7 +1737,7 @@ impl Editor {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.paste();
+                self.paste("before");
             },
             KeyEvent {
                 code: KeyCode::Char('j'),
@@ -1641,7 +1869,7 @@ impl Theme {
             modeline_color: hex_to_rgb("#1D2026").unwrap(), 
             modeline_lighter_color: hex_to_rgb("#252931").unwrap(), 
             minibuffer_color: hex_to_rgb("#21242B").unwrap(), 
-            dired_mode_color: hex_to_rgb("#ECBE7B").unwrap(), 
+            dired_mode_color: hex_to_rgb("#C678DD").unwrap(), 
             dired_timestamp_color: hex_to_rgb("#46D9FC").unwrap(), 
             dired_path_color: hex_to_rgb("#51AFEF").unwrap(), 
             dired_size_color: hex_to_rgb("#DA8548").unwrap(), 
@@ -1737,9 +1965,7 @@ macro_rules! register_command {
     };
 }
 
-// TODO command filterning, fuzzy matching highlight,
-//  change colors on selction
-
+// TODO Command filterning, Fuzzy matching highlight, Change colors on selction
 struct Fzy {
     active: bool,
     items: Vec<String>,

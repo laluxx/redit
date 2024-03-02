@@ -1,6 +1,12 @@
 * Editor
+Emacs mode []
+Cursor blink and pulse []
+Ability to open the message buffer []
+Make search case insensitive []
+icons in dired (optional) []
 Can't insert capital letters both in the buffer and in fzy works in the minibuffer []
 Each buffer should hold its cursor position []
 Dired not working as expected when using as "redit main.rs" []
+scroll on paste if necessary [x]
 
 
