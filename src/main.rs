@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, poll, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor, SetAttribute, Attribute},
     terminal::{self, ClearType, disable_raw_mode, enable_raw_mode, size},
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // TODO Syntax highlighting
 // extern crate tree_sitter;
@@ -270,6 +270,10 @@ struct Editor {
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
     copied_line: bool,
+    blink_cursor: bool,
+    cursor_blink_state: bool,
+    last_cursor_toggle: std::time::Instant,
+    force_show_cursor: bool,
 }
 
 impl Editor {
@@ -284,14 +288,9 @@ impl Editor {
             mode: Mode::Normal, 
             cursor_pos: (0, 0), 
             offset: (0, 0),
-            top_scroll_margin: 10,
-            bottom_scroll_margin: 10,
             buffer: vec![vec![]],
             themes,
             current_theme_name: initial_theme_name,
-            show_fringe: true,
-            show_line_numbers: true,
-            insert_line_cursor: false,
             dired: None,
             minibuffer_active: false,
             minibuffer_height: 1,
@@ -309,6 +308,16 @@ impl Editor {
             selection_start: None,
             selection_end: None,
             copied_line: false,
+            cursor_blink_state: true,
+            last_cursor_toggle: std::time::Instant::now(),
+            force_show_cursor: false,
+            // CONFIG
+            blink_cursor: true,
+            show_fringe: true,
+            show_line_numbers: true,
+            insert_line_cursor: false,
+            top_scroll_margin: 10,
+            bottom_scroll_margin: 10,
         }
     }
 
@@ -324,6 +333,13 @@ impl Editor {
         }
     }
 
+    fn quit(&self) {
+        let mut stdout = stdout();
+        disable_raw_mode().expect("Failed to disable raw mode");
+        execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show).expect("Failed to leave alternate screen");
+        std::process::exit(0);
+    }
+
     pub fn buffer_save(&self) -> Result<()> {
         let content: String = self.buffer.iter()
             .map(|line| line.iter().collect::<String>())
@@ -333,7 +349,6 @@ impl Editor {
         fs::write(&self.current_file_path, content)
             .expect("Failed to save file");
         
-        println!("File saved successfully.");
         Ok(())
     }
 
@@ -387,44 +402,15 @@ impl Editor {
         }
     }
 
+    fn back_to_indentation(&mut self) {
+        if let Some(line) = self.buffer.get(self.cursor_pos.1 as usize) {
+            let first_non_blank_index = line.iter()
+                .position(|&c| c != ' ' && c != '\t')
+                .unwrap_or(0) as u16;
 
-    // TODO CrossTerm don't support ctrl+backspace
-    fn backward_kill_word(&mut self) {
-        if self.cursor_pos.1 == 0 && self.cursor_pos.0 == 0 {
-            return;
+            self.cursor_pos.0 = first_non_blank_index;
         }
-
-        let line_idx = self.cursor_pos.1 as usize;
-        let mut char_idx = self.cursor_pos.0 as usize;
-        let line = &mut self.buffer[line_idx];
-
-        if char_idx == 0 {
-            if line_idx > 0 {
-                self.cursor_pos.1 -= 1;
-                let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
-                self.cursor_pos.0 = prev_line_len;
-            }
-            return;
-        }
-
-        let mut word_start = 0;
-        let mut found_non_whitespace = false;
-        for (i, &c) in line[..char_idx].iter().enumerate().rev() {
-            if c.is_whitespace() {
-                if found_non_whitespace {
-                    word_start = i + 1;
-                    break;
-                }
-            } else {
-                found_non_whitespace = true;
-            }
-        }
-
-        let removed = line.drain(word_start..char_idx).collect::<String>();
-        self.clipboard = removed; // Optionally, store the deleted text in the clipboard.
-        self.cursor_pos.0 = word_start as u16;
     }
-    
 
     fn up(&mut self) {
         if self.cursor_pos.1 > 0 {
@@ -884,7 +870,56 @@ impl Editor {
         Ok(())
     }
 
-    
+    fn draw_cursor(&mut self, stdout: &mut Stdout) -> Result<()> {
+        let (width, height) = terminal::size()?;
+
+        let cursor_pos = if self.minibuffer_active {
+            let minibuffer_cursor_pos_x = 1 + self.minibuffer_prefix.len() as u16 + self.minibuffer_content.len() as u16;
+            let minibuffer_cursor_pos_y = height - self.minibuffer_height;
+            (minibuffer_cursor_pos_x, minibuffer_cursor_pos_y)
+        } else if self.fzy.as_ref().map_or(false, |fzy| fzy.active) {
+            let minibuffer_cursor_pos_x = 18 + self.fzy.as_ref().map_or(0, |fzy| fzy.input.len()) as u16;
+            let minibuffer_cursor_pos_y = height - self.minibuffer_height;
+            (minibuffer_cursor_pos_x, minibuffer_cursor_pos_y)
+        } else if self.mode == Mode::Dired {
+            self.dired.as_ref().map_or((0, 0), |dired| {
+                let cursor_line = (dired.cursor_pos + 2).min(height - self.minibuffer_height - 1);
+                (dired.entry_first_char_column, cursor_line)
+            })
+        } else {
+            let mut start_col = 0;
+            if self.show_fringe {
+                start_col += 2;
+            }
+            if self.show_line_numbers {
+                start_col += 4;
+            }
+            let cursor_x = self.cursor_pos.0.saturating_sub(self.offset.0) + start_col;
+            let cursor_y = (self.cursor_pos.1.saturating_sub(self.offset.1)).min(height - self.minibuffer_height - 2);
+            (cursor_x, cursor_y)
+        };
+
+        // Handle cursor visibility based on blinking state and user preference
+        if self.blink_cursor && !self.force_show_cursor {
+            let blink_duration = Duration::from_millis(530); // Blink every 530 ms to approximate Emacs' default
+            if self.last_cursor_toggle.elapsed() >= blink_duration {
+                self.cursor_blink_state = !self.cursor_blink_state;
+                self.last_cursor_toggle = std::time::Instant::now();
+            }
+
+            if self.cursor_blink_state {
+                execute!(stdout, cursor::MoveTo(cursor_pos.0, cursor_pos.1), cursor::Show)?;
+            } else {
+                execute!(stdout, cursor::Hide)?;
+            }
+        } else {
+            // If blinking is disabled, ensure the cursor is always shown
+            execute!(stdout, cursor::MoveTo(cursor_pos.0, cursor_pos.1), cursor::Show)?;
+        }
+
+        Ok(())
+    }
+
     fn draw(&mut self, stdout: &mut Stdout) -> Result<()> {
         let (width, height) = terminal::size()?;
         let background_color = self.current_theme().background_color;
@@ -895,10 +930,8 @@ impl Editor {
             terminal::Clear(ClearType::All)
         )?;
 
-        // Always draw modeline and minibuffer
         self.draw_modeline(stdout, width, height)?;
         self.draw_minibuffer(stdout, width, height)?;
-
 
         if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out of `self`
             let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
@@ -930,49 +963,59 @@ impl Editor {
                 self.draw_line_numbers(stdout, height, start_col)?;
             }
             self.draw_text(stdout)?;
+            self.draw_search_highlight(stdout)?;
             self.draw_selection(stdout)?;
         }
 
-        let cursor_pos = if self.minibuffer_active {
-            let minibuffer_cursor_pos_x = 2 + self.minibuffer_prefix.len() as u16 + self.minibuffer_content.len() as u16;
-            let minibuffer_cursor_pos_y = height - self.minibuffer_height;
-            (minibuffer_cursor_pos_x, minibuffer_cursor_pos_y)
-        } else if self.fzy.as_ref().map_or(false, |fzy| fzy.active) { // Check if fzy is Some and active
-            // Access fzy.input safely via as_ref() and map_or
-            let minibuffer_cursor_pos_x = 18 + self.fzy.as_ref().map_or(0, |fzy| fzy.input.len()) as u16;
-            let minibuffer_cursor_pos_y = height - self.minibuffer_height;
-            (minibuffer_cursor_pos_x, minibuffer_cursor_pos_y)
-        } else if self.mode == Mode::Dired {
-            self.dired.as_ref().map_or((0, 0), |dired| {
-                let cursor_line = (dired.cursor_pos + 2).min(height - self.minibuffer_height - 1);
-                (dired.entry_first_char_column, cursor_line)
-            })
-        } else {
-            let mut start_col = 0;
-            if self.show_fringe {
-                start_col += 2; // Account for fringe
-            }
-            if self.show_line_numbers {
-                start_col += 4; // Account for line number
-            }
-            let cursor_x = self.cursor_pos.0.saturating_sub(self.offset.0) + start_col;
-            // Ensure cursor Y-position doesn't go into the minibuffer area or below.
-            let cursor_y = (self.cursor_pos.1.saturating_sub(self.offset.1)).min(height - self.minibuffer_height - 2);
-            (cursor_x, cursor_y)
-        };
 
-        // Position the cursor
-        execute!(
-            stdout,
-            cursor::MoveTo(cursor_pos.0, cursor_pos.1),
-            cursor::Show
-        )?;
+        // self.draw_cursor(stdout)?;
         
         io::stdout().flush()?;
         Ok(())
     }
 
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
+        let (width, height) = terminal::size()?;
+        let text_color = self.current_theme().text_color;
+        let background_color = self.current_theme().background_color;
+        let mut start_col_base = 0;
+
+        if self.show_fringe {
+            start_col_base += 2;
+        }
+
+        if self.show_line_numbers {
+            start_col_base += 4;
+        }
+
+        let bottom_exclude = self.minibuffer_height + 1;
+        let effective_width = width.saturating_sub(start_col_base);
+
+        for (idx, line) in self.buffer.iter().enumerate() {
+            if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+                let line_y = (idx - self.offset.1 as usize) as u16;
+                let line_content: String = line.iter().collect::<String>();
+                let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
+                    // If the line exceeds the effective width, truncate it
+                    line_content.chars().take(effective_width as usize).collect::<String>()
+                } else {
+                    line_content
+                };
+
+                execute!(
+                    stdout,
+                    MoveTo(start_col_base, line_y),
+                    SetForegroundColor(text_color),
+                    SetBackgroundColor(background_color),
+                    Print(truncated_line_content)
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw_search_highlight(&self, stdout: &mut io::Stdout) -> Result<()> {
         let (width, height) = size()?;
         let text_color = self.current_theme().text_color;
         let search_bg_color = self.current_theme().search_bg_color;
@@ -980,11 +1023,11 @@ impl Editor {
         let mut start_col_base = 0;
 
         if self.show_fringe {
-            start_col_base += 2; // Account for fringe width
+            start_col_base += 2;
         }
 
         if self.show_line_numbers {
-            start_col_base += 4; // Account for space for line numbers
+            start_col_base += 4;
         }
 
         let bottom_exclude = self.minibuffer_height + 1;
@@ -994,12 +1037,11 @@ impl Editor {
             &self.search_query
         };
 
-        for (idx, line) in self.buffer.iter().enumerate() {
-            if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-                let line_content: String = line.iter().collect();
-                let line_y = (idx - self.offset.1 as usize) as u16;
-
-                if self.highlight_search && !search_string.is_empty() {
+        if self.highlight_search && !search_string.is_empty() {
+            for (idx, line) in self.buffer.iter().enumerate() {
+                if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+                    let line_content: String = line.iter().collect();
+                    let line_y = (idx - self.offset.1 as usize) as u16;
                     let mut current_col = start_col_base;
                     let mut last_index = 0;
 
@@ -1016,14 +1058,14 @@ impl Editor {
 
                     let trailing_text = &line_content[last_index..];
                     execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(trailing_text))?;
-                } else {
-                    execute!(stdout, MoveTo(start_col_base, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(line_content))?;
                 }
             }
         }
 
         Ok(())
     }
+
+        
         
     // TODO ~ after the last line 3 options only one, none or untile the end
     // TODO Option for relative line numbers, add one padding when we reach 4 digits lines numbers
@@ -1160,14 +1202,13 @@ impl Editor {
             }
         }
 
-        // Draw minibuffer prefix and content. This occurs regardless of whether a message was just cleared.
         execute!(
             stdout,
             MoveTo(0, minibuffer_start_y),
             SetForegroundColor(prefix_fg),
             Print(format!(" {}", self.minibuffer_prefix)),
             SetForegroundColor(content_fg),
-            Print(format!(" {}", self.minibuffer_content))
+            Print(format!("{}", self.minibuffer_content))
         )?;
 
         Ok(())
@@ -1195,126 +1236,182 @@ impl Editor {
         Ok(())
     }
 
+    // fn run(&mut self) -> Result<()> {
+    //     let mut stdout = stdout();
+    //     enable_raw_mode()?;
+    //     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+
+    //     loop {
+    //         let fzy_active = self.fzy.as_ref().map_or(false, |fzy| fzy.active);
+    //         self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
+    //         self.draw(&mut stdout)?;
+
+    //         if let Event::Key(key) = event::read()? {
+    //             self.handle_keys(key)?;
+    //         }
+    //     }
+    // }
+
     fn run(&mut self) -> Result<()> {
         let mut stdout = stdout();
         enable_raw_mode()?;
         execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+        self.draw(&mut stdout)?; // Draw the first frame
+
+        let fzy_active = self.fzy.as_ref().map_or(false, |fzy| fzy.active); // TODO move out
 
         loop {
-            let fzy_active = self.fzy.as_ref().map_or(false, |fzy| fzy.active);
-            self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
-            self.draw(&mut stdout)?;
-            
-            if let Event::Key(key) = event::read()? {
-                let mut event_handled = false;
+            self.draw_cursor(&mut stdout)?;
 
-                if self.fzy.as_ref().map_or(false, |fzy| fzy.active) {
-                    if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out
-                        event_handled = fzy.handle_input(key, self);
-                        self.fzy.replace(fzy); // Put `fzy` back
-                        if event_handled {
-                            self.minibuffer_height = 1;
-                        }
-                    }
+            if poll(Duration::from_millis(270))? {
+                if let Event::Key(key) = event::read()? {
+                    self.force_show_cursor = true;
+                    self.handle_keys(key)?;
+                    self.last_cursor_toggle = std::time::Instant::now();
+                    self.draw(&mut stdout)?;
+                    self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active); // TODO move out
                 }
-
-                if self.minibuffer_active && !event_handled {
-                    match key.code {
-                        KeyCode::Char(c) => self.minibuffer_content.push(c),
-                        KeyCode::Backspace => { self.minibuffer_content.pop(); },
-                        KeyCode::Esc => {
-                            self.minibuffer_active = false;
-                            self.minibuffer_prefix.clear();
-                            self.minibuffer_content.clear();
-                            self.searching = false;
-                            self.search_query.clear();
-                        },
-                        KeyCode::Enter => {
-                            let minibuffer_content = std::mem::take(&mut self.minibuffer_content);
-                            if self.minibuffer_prefix == "Switch theme:" {
-                                self.switch_theme(&minibuffer_content);
-                            } else if self.minibuffer_prefix == ":" {
-                                if let Ok(line_number) = minibuffer_content.parse::<usize>() {
-                                    self.goto_line(line_number);
-                                } else {
-                                    self.message("Invalid line number.");
-                                }
-
-                            } else if self.minibuffer_prefix == "Search:" {
-                                self.search_query = minibuffer_content.clone();
-                                
-                                // Find the next occurrence of the search query from the cursor's current position.
-                                let mut found = false;
-                                for (line_idx, line) in self.buffer.iter().enumerate().skip(self.cursor_pos.1 as usize) {
-                                    // Determine start index for search in the current line.
-                                    let start_search_idx = if line_idx == self.cursor_pos.1 as usize { self.cursor_pos.0 as usize + 1 } else { 0 };
-                                    if let Some(match_idx) = line.iter().skip(start_search_idx).collect::<String>().find(&minibuffer_content) {
-                                        // Update cursor position to the start of the found match.
-                                        self.cursor_pos = (match_idx as u16, line_idx as u16);
-                                        found = true;
-                                        break;
-                                    }
-                                }
-
-                                // If no match is found after the current cursor position, optionally wrap the search to the beginning of the document.
-                                if !found {
-                                    for (line_idx, line) in self.buffer.iter().enumerate().take(self.cursor_pos.1 as usize + 1) {
-                                        if let Some(match_idx) = line.iter().collect::<String>().find(&minibuffer_content) {
-                                            self.cursor_pos = (match_idx as u16, line_idx as u16);
-                                            break;
-                                        }
-                                    }
-                                }
-                                self.adjust_view_to_cursor("");
-                            } else if self.mode == Mode::Dired {
-                                if self.minibuffer_prefix == "Create directory:" {
-                                    if let Some(dired) = &mut self.dired {
-                                        dired.create_directory(&minibuffer_content)?;
-                                        dired.refresh_directory_contents()?;
-                                    }
-                                } else if self.minibuffer_prefix.starts_with("Delete ") && self.minibuffer_prefix.ends_with(" [y/n]:") {
-                                    if minibuffer_content == "y" {
-                                        if let Some(dired) = &mut self.dired {
-                                            dired.delete_entry()?;
-                                        }
-                                    }
-                                } else if self.minibuffer_prefix == "Rename:" {
-                                    if let Some(dired) = &mut self.dired {
-                                        dired.rename_entry(&minibuffer_content)?;
-                                    }
-                                } else {
-                                    let file_path = self.dired.as_ref().unwrap().current_path.join(&minibuffer_content);
-                                    if std::fs::File::create(&file_path).is_ok() {
-                                        if let Some(dired) = &mut self.dired {
-                                            dired.refresh_directory_contents()?;
-                                            if self.should_open_file {
-                                                self.open(&file_path, None)?;
-                                            }
-                                        }
-                                    }
-                                    self.should_open_file = false;
-                                }
-                            }
-                            self.minibuffer_active = false;
-                            self.minibuffer_prefix.clear();
-                            event_handled = true;
-                        },
-                        _ => {}
-                    }
-                }
-
-                if !event_handled && !self.fzy.as_ref().map_or(false, |fzy| fzy.active) && !self.minibuffer_active {
-                    match self.mode {
-                        Mode::Normal => self.handle_normal_mode(key)?,
-                        Mode::Insert => self.handle_insert_mode(key)?,
-                        Mode::Dired => self.handle_dired_mode(key)?,
-                        Mode::Visual => self.handle_visual_mode(key)?,
+            } else {
+                if self.last_cursor_toggle.elapsed() >= Duration::from_millis(530) {
+                    if self.force_show_cursor {
+                        self.force_show_cursor = false;
+                        self.last_cursor_toggle = Instant::now();
                     }
                 }
             }
         }
     }
-    
+       
+    fn handle_keys(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        let mut event_handled = false;
+
+        if self.fzy.as_ref().map_or(false, |fzy| fzy.active) {
+            if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out
+                event_handled = fzy.handle_input(key, self);
+                self.fzy.replace(fzy); // Put `fzy` back
+                if event_handled {
+                    self.minibuffer_height = 1;
+                }
+            }
+        }
+
+        if self.minibuffer_active && !event_handled {
+            match key.code {
+                KeyCode::Char(c) => self.minibuffer_content.push(c),
+                KeyCode::Backspace => { self.minibuffer_content.pop(); },
+                KeyCode::Esc => {
+                    self.minibuffer_active = false;
+                    self.minibuffer_prefix.clear();
+                    self.minibuffer_content.clear();
+                    self.searching = false;
+                    self.search_query.clear();
+                },
+                KeyCode::Enter => {
+                    let minibuffer_content = std::mem::take(&mut self.minibuffer_content);
+                    if self.minibuffer_prefix == "Switch theme: " {
+                        self.switch_theme(&minibuffer_content);
+                    } else if self.minibuffer_prefix == ":" {
+                        match minibuffer_content.as_str() {
+                            "w" => {
+                                match self.buffer_save() {
+                                    Ok(_) => self.message("File saved successfully."),
+                                    Err(e) => self.message(&format!("Failed to save file: {}", e)),
+                                }
+                            },
+                            "q" => {
+                                self.quit();
+                            },
+                            "wq" => {
+                                self.buffer_save()?;
+                                self.quit();
+                            },
+                            _ => {
+                                if let Ok(line_number) = minibuffer_content.parse::<usize>() {
+                                    self.goto_line(line_number);
+                                } else {
+                                    self.message("Invalid command");
+                                }
+                            }
+                        }
+                    } else if self.minibuffer_prefix == "Search: " {
+                        self.search_query = minibuffer_content.clone();
+
+                        // Find the next occurrence of the search query from the cursor's current position.
+                        let mut found = false;
+                        for (line_idx, line) in self.buffer.iter().enumerate().skip(self.cursor_pos.1 as usize) {
+                            // Determine start index for search in the current line.
+                            let start_search_idx = if line_idx == self.cursor_pos.1 as usize { self.cursor_pos.0 as usize + 1 } else { 0 };
+                            if let Some(match_idx) = line.iter().skip(start_search_idx).collect::<String>().find(&minibuffer_content) {
+                                // Update cursor position to the start of the found match.
+                                self.cursor_pos = (match_idx as u16, line_idx as u16);
+                                found = true;
+                                break;
+                            }
+                        }
+
+                        // If no match is found after the current cursor position, optionally wrap the search to the beginning of the document.
+                        if !found {
+                            for (line_idx, line) in self.buffer.iter().enumerate().take(self.cursor_pos.1 as usize + 1) {
+                                if let Some(match_idx) = line.iter().collect::<String>().find(&minibuffer_content) {
+                                    self.cursor_pos = (match_idx as u16, line_idx as u16);
+                                    break;
+                                }
+                            }
+                        }
+                        self.adjust_view_to_cursor("");
+                    } else if self.mode == Mode::Dired {
+                        if self.minibuffer_prefix == "Create directory: " {
+                            if let Some(dired) = &mut self.dired {
+                                dired.create_directory(&minibuffer_content)?;
+                                dired.refresh_directory_contents()?;
+                            }
+                        } else if self.minibuffer_prefix.starts_with("Delete ") && self.minibuffer_prefix.ends_with(" [y/n]: ") {
+                            if minibuffer_content == "y" {
+                                if let Some(dired) = &mut self.dired {
+                                    dired.delete_entry()?;
+                                }
+                            }
+                        } else if self.minibuffer_prefix == "Rename: " {
+                            if let Some(dired) = &mut self.dired {
+                                dired.rename_entry(&minibuffer_content)?;
+                            }
+                        } else {
+                            let file_path = self.dired.as_ref().unwrap().current_path.join(&minibuffer_content);
+                            if std::fs::File::create(&file_path).is_ok() {
+                                if let Some(dired) = &mut self.dired {
+                                    dired.refresh_directory_contents()?;
+                                    if self.should_open_file {
+                                        self.open(&file_path, None)?;
+                                    }
+                                }
+                            }
+                            self.should_open_file = false;
+                        }
+                    }
+                    self.minibuffer_active = false;
+                    self.minibuffer_prefix.clear();
+                    event_handled = true;
+                },
+                _ => {}
+            }
+        }
+
+
+        // Assuming the mode handling functions do not return any value (unit type `()`) and you just need to call them
+        if !event_handled && !self.fzy.as_ref().map_or(false, |fzy| fzy.active) && !self.minibuffer_active {
+            // Since these functions might return a Result type, we use `?` to handle any errors.
+            match self.mode {
+                Mode::Normal => { self.handle_normal_mode(key)?; },
+                Mode::Insert => { self.handle_insert_mode(key)?; },
+                Mode::Dired => { self.handle_dired_mode(key)?; },
+                Mode::Visual => { self.handle_visual_mode(key)?; },
+            }
+        }
+
+        Ok(())
+    }
+
+        
     fn set_cursor_shape(&self) {
         let block = "\x1b[2 q";
         let line = "\x1b[6 q";
@@ -1393,7 +1490,7 @@ impl Editor {
 
             KeyCode::Char('d') => {
                 self.minibuffer_active = true;
-                self.minibuffer_prefix = "Create directory:".to_string();
+                self.minibuffer_prefix = "Create directory: ".to_string();
                 self.minibuffer_content = "".to_string();
             },
 
@@ -1403,7 +1500,7 @@ impl Editor {
                         let entry_to_delete = &dired.entries[dired.cursor_pos as usize - 2];
                         let entry_name = entry_to_delete.file_name().to_string_lossy().into_owned();
 
-                        self.minibuffer_prefix = format!("Delete {} [y/n]:", entry_name);
+                        self.minibuffer_prefix = format!("Delete {} [y/n]: ", entry_name);
                         self.minibuffer_active = true;
                         self.minibuffer_content = "".to_string();
                     }
@@ -1419,7 +1516,7 @@ impl Editor {
 
                         // Activate the minibuffer for renaming, pre-filling it with the entry's name
                         self.minibuffer_active = true;
-                        self.minibuffer_prefix = "Rename:".to_string();
+                        self.minibuffer_prefix = "Rename: ".to_string();
                         self.minibuffer_content = entry_name;
                     }
                 }
@@ -1443,7 +1540,7 @@ impl Editor {
                 ..
             } => {
                 self.minibuffer_active = true;
-                self.minibuffer_prefix = "Switch theme:".to_string();
+                self.minibuffer_prefix = "Switch theme: ".to_string();
                 self.minibuffer_content = "".to_string();
             },
 
@@ -1521,7 +1618,7 @@ impl Editor {
                 let last_line_len = self.buffer.last().map_or(0, |line| line.len());
                 self.cursor_pos.0 = last_line_len as u16; // Move to the end of the last line
                 let (_, height) = size()?;
-                let visible_lines = height - self.minibuffer_height - 1; // Account for modeline
+                let visible_lines = height - self.minibuffer_height - 1;
                 if self.buffer.len() as u16 > visible_lines {
                     self.offset.1 = self.buffer.len() as u16 - visible_lines;
                 }
@@ -1554,6 +1651,23 @@ impl Editor {
             } => {
                 self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16;
                 self.mode = Mode::Insert;
+                self.set_cursor_shape();
+            },
+            KeyEvent {
+                code: KeyCode::Char('I'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.back_to_indentation();
+                self.mode = Mode::Insert;
+                self.set_cursor_shape();
+            },
+            KeyEvent {
+                code: KeyCode::Char('m'),
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => {
+                self.back_to_indentation();
             },
             KeyEvent {
                 code: KeyCode::Char('P'),
@@ -1585,7 +1699,7 @@ impl Editor {
                     self.searching = true;
                     self.highlight_search = true;
                     self.minibuffer_active = true;
-                    self.minibuffer_prefix = "Search:".to_string();
+                    self.minibuffer_prefix = "Search: ".to_string();
                 },
                 KeyCode::Char('n') => {
                     self.highlight_search = true;
@@ -1617,6 +1731,7 @@ impl Editor {
                 KeyCode::Char('a') => {
                     self.right();
                     self.mode = Mode::Insert;
+                    self.set_cursor_shape();
                 },
                 KeyCode::Char('v') => {
                     // TODO clamp the cursor position
@@ -1656,9 +1771,7 @@ impl Editor {
                     self.right();
                 },
                 KeyCode::Char('q') => {
-                    disable_raw_mode()?;
-                    execute!(stdout(), terminal::LeaveAlternateScreen, cursor::Show)?;
-                    std::process::exit(0);
+                    self.quit();
                 },
                 _ => {}
             },

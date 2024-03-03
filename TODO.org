@@ -1,12 +1,61 @@
 * Editor
+copying should copy to the actual system clipboard too []
 Emacs mode []
-Cursor blink and pulse []
 Ability to open the message buffer []
 Make search case insensitive []
-icons in dired (optional) []
 Can't insert capital letters both in the buffer and in fzy works in the minibuffer []
 Each buffer should hold its cursor position []
-Dired not working as expected when using as "redit main.rs" []
 scroll on paste if necessary [x]
+** Cursor Blink
+Option to blink only in insert mode []
+Stop blinking after 10 times []
+Cursor blink [x]
+** Backward_kill_ward
+#+begin_src rust
+// TODO CrossTerm don't support ctrl+backspace
+fn backward_kill_word(&mut self) {
+    if self.cursor_pos.1 == 0 && self.cursor_pos.0 == 0 {
+        return;
+    }
+
+    let line_idx = self.cursor_pos.1 as usize;
+    let mut char_idx = self.cursor_pos.0 as usize;
+    let line = &mut self.buffer[line_idx];
+
+    if char_idx == 0 {
+        if line_idx > 0 {
+            self.cursor_pos.1 -= 1;
+            let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+            self.cursor_pos.0 = prev_line_len;
+        }
+        return;
+    }
+
+    let mut word_start = 0;
+    let mut found_non_whitespace = false;
+    for (i, &c) in line[..char_idx].iter().enumerate().rev() {
+        if c.is_whitespace() {
+            if found_non_whitespace {
+                word_start = i + 1;
+                break;
+            }
+        } else {
+            found_non_whitespace = true;
+        }
+    }
+
+    let removed = line.drain(word_start..char_idx).collect::<String>();
+    self.clipboard = removed; // Optionally, store the deleted text in the clipboard.
+    self.cursor_pos.0 = word_start as u16;
+}
+#+end_src
+** Dired
+*** New features
+Preview on the right for files images etc.. []
+icons in dired (optional) []
+Tab key, to open a tree of the directory under the cursor without opening a new buffer
+for files it will show all the methods when lsp will work []
+*** Bugs
+Dired not working as expected when using as "redit main.rs" []
 
 
