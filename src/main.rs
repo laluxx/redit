@@ -274,6 +274,9 @@ struct Editor {
     cursor_blink_state: bool,
     last_cursor_toggle: std::time::Instant,
     force_show_cursor: bool,
+    blink_count: u8,
+    blink_limit: u8,
+    show_hl_line: bool,
 }
 
 impl Editor {
@@ -311,13 +314,16 @@ impl Editor {
             cursor_blink_state: true,
             last_cursor_toggle: std::time::Instant::now(),
             force_show_cursor: false,
+            blink_count: 0,
             // CONFIG
             blink_cursor: true,
+            blink_limit: 10,
             show_fringe: true,
             show_line_numbers: true,
             insert_line_cursor: false,
             top_scroll_margin: 10,
             bottom_scroll_margin: 10,
+            show_hl_line: false,
         }
     }
 
@@ -899,25 +905,35 @@ impl Editor {
             (cursor_x, cursor_y)
         };
 
-        // Handle cursor visibility based on blinking state and user preference
-        if self.blink_cursor && !self.force_show_cursor {
-            let blink_duration = Duration::from_millis(530); // Blink every 530 ms to approximate Emacs' default
-            if self.last_cursor_toggle.elapsed() >= blink_duration {
+        if self.blink_cursor && (self.blink_count / 2 < self.blink_limit || self.force_show_cursor) {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_cursor_toggle) >= Duration::from_millis(530) {
                 self.cursor_blink_state = !self.cursor_blink_state;
-                self.last_cursor_toggle = std::time::Instant::now();
+                self.last_cursor_toggle = now;
+                if !self.force_show_cursor {
+                    self.blink_count += 1;
+                }
             }
 
-            if self.cursor_blink_state {
+            if self.cursor_blink_state || self.force_show_cursor {
                 execute!(stdout, cursor::MoveTo(cursor_pos.0, cursor_pos.1), cursor::Show)?;
             } else {
                 execute!(stdout, cursor::Hide)?;
             }
         } else {
-            // If blinking is disabled, ensure the cursor is always shown
+            // Always show the cursor if blinking is disabled or limit reached without force_show_cursor.
             execute!(stdout, cursor::MoveTo(cursor_pos.0, cursor_pos.1), cursor::Show)?;
         }
 
+        // Reset force_show_cursor
+        if self.force_show_cursor {
+            self.force_show_cursor = false;
+            self.blink_count = 0;
+            // self.last_cursor_toggle = Instant::now();
+        }
+
         Ok(())
+
     }
 
     fn draw(&mut self, stdout: &mut Stdout) -> Result<()> {
@@ -962,13 +978,12 @@ impl Editor {
             if self.show_line_numbers {
                 self.draw_line_numbers(stdout, height, start_col)?;
             }
+
             self.draw_text(stdout)?;
+            self.draw_hl_line(stdout)?;
             self.draw_search_highlight(stdout)?;
             self.draw_selection(stdout)?;
         }
-
-
-        // self.draw_cursor(stdout)?;
         
         io::stdout().flush()?;
         Ok(())
@@ -1065,7 +1080,54 @@ impl Editor {
         Ok(())
     }
 
-        
+    fn draw_hl_line(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+        if self.show_hl_line {
+            let (width, _height) = terminal::size()?;
+            let hl_color = self.current_theme().hl_line_color;
+
+            let visible_line_index = self.cursor_pos.1 - self.offset.1;
+
+            let mut start_col = 0;
+
+            if self.show_fringe {
+                start_col += 2;
+            }
+
+            if self.show_line_numbers {
+                start_col += 4;
+            }
+            
+            execute!(
+                stdout,
+                cursor::MoveTo(start_col, visible_line_index as u16),
+                SetBackgroundColor(hl_color),
+                Print(" ".repeat((width - start_col) as usize))
+            )?;
+
+            // Redraw the text for the highlighted line if it's within the current view
+            if let Some(line) = self.buffer.get((self.cursor_pos.1) as usize) {
+                let text_color = self.current_theme().text_color; // Text color
+                for (i, &ch) in line.iter().enumerate() {
+                    execute!(
+                        stdout,
+                        cursor::MoveTo(start_col + i as u16, visible_line_index as u16),
+                        SetForegroundColor(text_color),
+                        Print(ch)
+                    )?;
+                }
+            }
+
+            // Reset the background color after highlighting
+            execute!(
+                stdout,
+                SetBackgroundColor(self.current_theme().background_color)
+            )?;
+
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
         
     // TODO ~ after the last line 3 options only one, none or untile the end
     // TODO Option for relative line numbers, add one padding when we reach 4 digits lines numbers
@@ -1236,47 +1298,24 @@ impl Editor {
         Ok(())
     }
 
-    // fn run(&mut self) -> Result<()> {
-    //     let mut stdout = stdout();
-    //     enable_raw_mode()?;
-    //     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
-
-    //     loop {
-    //         let fzy_active = self.fzy.as_ref().map_or(false, |fzy| fzy.active);
-    //         self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
-    //         self.draw(&mut stdout)?;
-
-    //         if let Event::Key(key) = event::read()? {
-    //             self.handle_keys(key)?;
-    //         }
-    //     }
-    // }
-
     fn run(&mut self) -> Result<()> {
         let mut stdout = stdout();
         enable_raw_mode()?;
         execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
         self.draw(&mut stdout)?; // Draw the first frame
-
-        let fzy_active = self.fzy.as_ref().map_or(false, |fzy| fzy.active); // TODO move out
-
+        let fzy_active = self.fzy.as_ref().map_or(false, |fzy| fzy.active);
+        self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
         loop {
             self.draw_cursor(&mut stdout)?;
 
             if poll(Duration::from_millis(270))? {
                 if let Event::Key(key) = event::read()? {
                     self.force_show_cursor = true;
+                    self.blink_count = 0;
                     self.handle_keys(key)?;
                     self.last_cursor_toggle = std::time::Instant::now();
                     self.draw(&mut stdout)?;
-                    self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active); // TODO move out
-                }
-            } else {
-                if self.last_cursor_toggle.elapsed() >= Duration::from_millis(530) {
-                    if self.force_show_cursor {
-                        self.force_show_cursor = false;
-                        self.last_cursor_toggle = Instant::now();
-                    }
+                    self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
                 }
             }
         }
@@ -1940,6 +1979,7 @@ struct Theme {
     search_bg_color: Color,
     visual_mode_color: Color,
     selection_color: Color,
+    hl_line_color: Color,
 }
 
 impl Theme {
@@ -1967,6 +2007,7 @@ impl Theme {
             search_bg_color: hex_to_rgb("#3B5238").unwrap(),
             visual_mode_color: hex_to_rgb("#3B5238").unwrap(),
             selection_color: hex_to_rgb("#262626").unwrap(),
+            hl_line_color: hex_to_rgb("#070707").unwrap(),
         }
     }
 
@@ -1994,6 +2035,7 @@ impl Theme {
             search_bg_color: hex_to_rgb("#387AA7").unwrap(),
             visual_mode_color: hex_to_rgb("#C678DD").unwrap(),
             selection_color: hex_to_rgb("#42444A").unwrap(),
+            hl_line_color: hex_to_rgb("#21242B").unwrap(),
         }
     }
 
