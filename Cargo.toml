@@ -2,11 +2,17 @@
 name = "redit"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 chrono = "0.4.34"
 crossterm = "0.27.0"
+directories = "5.0.1"
+mlua = { version = "0.7.0", features = ["lua54"] }
 # tree-sitter = "0.20.0"
 # tree-sitter-rust = "0.20.4"
+
+[build-dependencies]
+directories = "5.0.1"

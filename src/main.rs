@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // TODO Syntax highlighting
 // extern crate tree_sitter;
@@ -241,19 +241,61 @@ impl Dired {
     }
 }
 
+use mlua::{Lua, Result as LuaResult};
+
+#[derive(Debug)]
+struct Config {
+    blink_cursor: bool,
+    show_fringe: bool,
+    show_line_numbers: bool,
+    insert_line_cursor: bool,
+    show_hl_line: bool,
+    top_scroll_margin: u16,
+    bottom_scroll_margin: u16,
+    blink_limit: u8,
+}
+
+impl Config {
+    fn new(lua_script_path: Option<&str>) -> LuaResult<Self> {
+        let lua = Lua::new();
+        let defaults = Config {
+            blink_cursor: true,
+            show_fringe: true,
+            show_line_numbers: true,
+            insert_line_cursor: false,
+            show_hl_line: false,
+            top_scroll_margin: 10,
+            bottom_scroll_margin: 10,
+            blink_limit: 10,
+        };
+
+        if let Some(path) = lua_script_path {
+            lua.load(&std::fs::read_to_string(path)?).exec()?;
+            let globals = lua.globals();
+            Ok(Config {
+                blink_cursor: globals.get("Blink_cursor").unwrap_or(defaults.blink_cursor),
+                show_fringe: globals.get("Show_fringe").unwrap_or(defaults.show_fringe),
+                show_line_numbers: globals.get("Show_line_numbers").unwrap_or(defaults.show_line_numbers),
+                insert_line_cursor: globals.get("Insert_line_cursor").unwrap_or(defaults.insert_line_cursor),
+                show_hl_line: globals.get("Show_hl_line").unwrap_or(defaults.show_hl_line),
+                top_scroll_margin: globals.get("Top_scroll_margin").unwrap_or(defaults.top_scroll_margin),
+                bottom_scroll_margin: globals.get("Bottom_scroll_margin").unwrap_or(defaults.bottom_scroll_margin),
+                blink_limit: globals.get("Blink_limit").unwrap_or(defaults.blink_limit),
+            })
+        } else {
+            Ok(defaults)
+        }
+    }
+}
+
 struct Editor {
     mode: Mode,
     dired: Option<Dired>,
     cursor_pos: (u16, u16),
     offset: (u16, u16),
-    top_scroll_margin: u16,
-    bottom_scroll_margin: u16,
     buffer: Vec<Vec<char>>,
     themes: HashMap<String, Theme>,
     current_theme_name: String,
-    show_fringe: bool,
-    show_line_numbers: bool,
-    insert_line_cursor: bool,
     minibuffer_active: bool,
     minibuffer_height: u16,
     minibuffer_content: String,
@@ -270,26 +312,27 @@ struct Editor {
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
     copied_line: bool,
-    blink_cursor: bool,
     cursor_blink_state: bool,
     last_cursor_toggle: std::time::Instant,
     force_show_cursor: bool,
     blink_count: u8,
-    blink_limit: u8,
-    show_hl_line: bool,
+    config: Config,
 }
 
 impl Editor {
-    fn new() -> Editor {
+    fn new(config_path: Option<&str>) -> LuaResult<Editor> {
         let mut themes = HashMap::new();
         themes.insert("nature".to_string(), Theme::nature());
         themes.insert("doom-one".to_string(), Theme::doom_one());
         let initial_theme_name = "nature".to_string();
-        let current_path = env::current_dir().unwrap();
+        let current_path = env::current_dir().expect("Failed to determine the current directory");
 
-        Editor { 
-            mode: Mode::Normal, 
-            cursor_pos: (0, 0), 
+        // Load configuration from a Lua script or use default values
+        let config = Config::new(config_path)?;
+
+        Ok(Editor {
+            mode: Mode::Normal,
+            cursor_pos: (0, 0),
             offset: (0, 0),
             buffer: vec![vec![]],
             themes,
@@ -315,18 +358,35 @@ impl Editor {
             last_cursor_toggle: std::time::Instant::now(),
             force_show_cursor: false,
             blink_count: 0,
-            // CONFIG
-            blink_cursor: true,
-            blink_limit: 10,
-            show_fringe: true,
-            show_line_numbers: true,
-            insert_line_cursor: false,
-            top_scroll_margin: 10,
-            bottom_scroll_margin: 10,
-            show_hl_line: false,
-        }
+            config,
+        })
     }
 
+    // TODO use tables instead
+    fn eval_buffer(&mut self) -> LuaResult<()> {
+        let lua = Lua::new();
+        let buffer_content = self.buffer.iter()
+            .map(|line| line.iter().collect::<String>())
+            .collect::<Vec<String>>().join("\n");
+
+        lua.load(&buffer_content).exec()?;
+        
+        let globals = lua.globals();
+
+        self.config.blink_cursor = globals.get("Blink_cursor").unwrap_or(self.config.blink_cursor);
+        self.config.show_fringe = globals.get("Show_fringe").unwrap_or(self.config.show_fringe);
+        self.config.show_line_numbers = globals.get("Show_line_numbers").unwrap_or(self.config.show_line_numbers);
+        self.config.insert_line_cursor = globals.get("Insert_line_cursor").unwrap_or(self.config.insert_line_cursor);
+        self.config.show_hl_line = globals.get("Show_hl_line").unwrap_or(self.config.show_hl_line);
+        self.config.top_scroll_margin = globals.get("Top_scroll_margin").unwrap_or(self.config.top_scroll_margin);
+        self.config.bottom_scroll_margin = globals.get("Bottom_scroll_margin").unwrap_or(self.config.bottom_scroll_margin);
+        self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
+
+        Ok(())
+    }
+
+
+    
     fn current_theme(&self) -> &Theme {
         self.themes.get(&self.current_theme_name).expect("Current theme not found")
     }
@@ -367,7 +427,7 @@ impl Editor {
         let (_, height) = terminal::size().unwrap();
         let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
 
-        let effective_text_area_height = text_area_height - self.bottom_scroll_margin;
+        let effective_text_area_height = text_area_height - self.config.bottom_scroll_margin;
 
         if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
             let max_offset_possible = if self.buffer.len() as u16 > text_area_height {
@@ -429,7 +489,7 @@ impl Editor {
             }
 
             // Top scroll margin
-            if self.cursor_pos.1 < self.offset.1 + self.top_scroll_margin && self.offset.1 > 0 {
+            if self.cursor_pos.1 < self.offset.1 + self.config.top_scroll_margin && self.offset.1 > 0 {
                 self.offset.1 -= 1;
             }
         }
@@ -448,7 +508,7 @@ impl Editor {
                 self.cursor_pos.0 = next_line_len;
             }
 
-            let effective_text_area_height = text_area_height - self.bottom_scroll_margin;
+            let effective_text_area_height = text_area_height - self.config.bottom_scroll_margin;
             // Adjust offset if cursor moves beyond the last line of the effective text area
             if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
                 // Only scroll if not at the last document line
@@ -489,10 +549,10 @@ impl Editor {
             },
             _ => {
                 // Default behavior respecting top and bottom scroll margins
-                if self.cursor_pos.1 < self.offset.1 + self.top_scroll_margin {
-                    self.offset.1 = self.cursor_pos.1.saturating_sub(self.top_scroll_margin);
-                } else if self.cursor_pos.1 + self.bottom_scroll_margin >= self.offset.1 + text_area_height {
-                    self.offset.1 = self.cursor_pos.1 + self.bottom_scroll_margin + 1 - text_area_height;
+                if self.cursor_pos.1 < self.offset.1 + self.config.top_scroll_margin {
+                    self.offset.1 = self.cursor_pos.1.saturating_sub(self.config.top_scroll_margin);
+                } else if self.cursor_pos.1 + self.config.bottom_scroll_margin >= self.offset.1 + text_area_height {
+                    self.offset.1 = self.cursor_pos.1 + self.config.bottom_scroll_margin + 1 - text_area_height;
                 }
             }
         }
@@ -802,7 +862,7 @@ impl Editor {
         // Scroll logic to ensure the cursor is visible after pasting.
         let (_, height) = terminal::size().unwrap();
         let text_area_height = height - self.minibuffer_height - 1;
-        let effective_text_area_height = text_area_height - self.bottom_scroll_margin;
+        let effective_text_area_height = text_area_height - self.config.bottom_scroll_margin;
         if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
             let max_offset_possible = if self.buffer.len() as u16 > text_area_height {
                 self.buffer.len() as u16 - text_area_height
@@ -841,10 +901,10 @@ impl Editor {
 
             // Calculate the starting column base considering fringe and line numbers
             let mut start_col_base = 0;
-            if self.show_fringe {
+            if self.config.show_fringe {
                 start_col_base += 2; // Account for fringe width
             }
-            if self.show_line_numbers {
+            if self.config.show_line_numbers {
                 start_col_base += 4; // Account for space for line numbers
             }
 
@@ -894,10 +954,10 @@ impl Editor {
             })
         } else {
             let mut start_col = 0;
-            if self.show_fringe {
+            if self.config.show_fringe {
                 start_col += 2;
             }
-            if self.show_line_numbers {
+            if self.config.show_line_numbers {
                 start_col += 4;
             }
             let cursor_x = self.cursor_pos.0.saturating_sub(self.offset.0) + start_col;
@@ -905,7 +965,7 @@ impl Editor {
             (cursor_x, cursor_y)
         };
 
-        if self.blink_cursor && (self.blink_count / 2 < self.blink_limit || self.force_show_cursor) {
+        if self.config.blink_cursor && (self.blink_count / 2 < self.config.blink_limit || self.force_show_cursor) {
             let now = std::time::Instant::now();
             if now.duration_since(self.last_cursor_toggle) >= Duration::from_millis(530) {
                 self.cursor_blink_state = !self.cursor_blink_state;
@@ -971,11 +1031,11 @@ impl Editor {
         // Draw text area for non-Dired modes
         if self.mode != Mode::Dired {
             let mut start_col = 0;
-            if self.show_fringe {
+            if self.config.show_fringe {
                 self.draw_fringe(stdout, height)?;
                 start_col += 2;
             }
-            if self.show_line_numbers {
+            if self.config.show_line_numbers {
                 self.draw_line_numbers(stdout, height, start_col)?;
             }
 
@@ -995,11 +1055,11 @@ impl Editor {
         let background_color = self.current_theme().background_color;
         let mut start_col_base = 0;
 
-        if self.show_fringe {
+        if self.config.show_fringe {
             start_col_base += 2;
         }
 
-        if self.show_line_numbers {
+        if self.config.show_line_numbers {
             start_col_base += 4;
         }
 
@@ -1037,11 +1097,11 @@ impl Editor {
         let background_color = self.current_theme().background_color;
         let mut start_col_base = 0;
 
-        if self.show_fringe {
+        if self.config.show_fringe {
             start_col_base += 2;
         }
 
-        if self.show_line_numbers {
+        if self.config.show_line_numbers {
             start_col_base += 4;
         }
 
@@ -1081,7 +1141,7 @@ impl Editor {
     }
 
     fn draw_hl_line(&self, stdout: &mut io::Stdout) -> io::Result<()> {
-        if self.show_hl_line {
+        if self.config.show_hl_line {
             let (width, _height) = terminal::size()?;
             let hl_color = self.current_theme().hl_line_color;
 
@@ -1089,11 +1149,11 @@ impl Editor {
 
             let mut start_col = 0;
 
-            if self.show_fringe {
+            if self.config.show_fringe {
                 start_col += 2;
             }
 
-            if self.show_line_numbers {
+            if self.config.show_line_numbers {
                 start_col += 4;
             }
             
@@ -1132,7 +1192,7 @@ impl Editor {
     // TODO ~ after the last line 3 options only one, none or untile the end
     // TODO Option for relative line numbers, add one padding when we reach 4 digits lines numbers
     fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
-        if self.show_line_numbers {
+        if self.config.show_line_numbers {
             let bottom_exclude = self.minibuffer_height + 1;
 
             for y in 0..height - bottom_exclude {
@@ -1161,7 +1221,7 @@ impl Editor {
     }
 
     fn draw_fringe(&self, stdout: &mut io::Stdout, height: u16) -> Result<()> {
-        if self.show_fringe {
+        if self.config.show_fringe {
             let fringe_color = self.current_theme().fringe_color;
             let bottom_exclude = self.minibuffer_height + 1;
 
@@ -1457,7 +1517,7 @@ impl Editor {
 
         let shape = match self.mode {
             Mode::Normal | Mode::Dired | Mode::Visual => block,
-            Mode::Insert => if self.insert_line_cursor { line } else { block },
+            Mode::Insert => if self.config.insert_line_cursor { line } else { block },
         };
 
         print!("{}", shape);
@@ -1602,7 +1662,7 @@ impl Editor {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.show_line_numbers = !self.show_line_numbers;
+                self.config.show_line_numbers = !self.config.show_line_numbers;
             }
 
             KeyEvent {
@@ -1610,7 +1670,7 @@ impl Editor {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.show_fringe = !self.show_fringe;
+                self.config.show_fringe = !self.config.show_fringe;
             }
             KeyEvent {
                 code: KeyCode::Char('p'),
@@ -2081,11 +2141,23 @@ impl Theme {
     }
 }
 
-
+use directories::BaseDirs;
+    
+fn get_config_path() -> Option<PathBuf> {
+    if let Some(base_dirs) = BaseDirs::new() {
+        let config_dir = base_dirs.home_dir().join(".config/redit/config.lua");
+        if config_dir.exists() {
+            return Some(config_dir);
+        }
+    }
+    None
+}
+    
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    let mut editor = Editor::new();
+    let config_path = get_config_path().map(|path| path.to_str().unwrap().to_string());
+    let mut editor = Editor::new(config_path.as_deref()).expect("Failed to create editor");
 
     if args.len() > 1 {
         let file_path = PathBuf::from(&args[1]);
@@ -2096,6 +2168,8 @@ fn main() -> Result<()> {
 }
 
 
+
+    
 fn hex_to_rgb(hex: &str) -> std::result::Result<Color, &'static str> {
     if hex.starts_with('#') && hex.len() == 7 {
         let r = u8::from_str_radix(&hex[1..3], 16).map_err(|_| "Invalid hex format")?;
@@ -2140,6 +2214,7 @@ impl Fzy {
         let mut commands: HashMap<String, Box<dyn FnMut(&mut Editor) -> io::Result<()>>> = HashMap::new();
         register_command!(commands, "save-buffer", Editor::buffer_save);
         register_command!(commands, "dired-jump", Editor::dired_jump);
+        register_command!(commands, "eval-buffer", Editor::eval_buffer);
         Fzy {
             active: false,
             items: Vec::new(),
