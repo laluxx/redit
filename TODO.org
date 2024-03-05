@@ -6,9 +6,12 @@ Make search case insensitive []
 Can't insert capital letters both in the buffer and in fzy works in the minibuffer []
 Each buffer should hold its cursor position []
 scroll on paste if necessary [x]
+** Lua
+Define commands as functions i lua and execute them with M-x []
+Call rust editor functions from lua []
 ** Cursor Blink
 Option to blink only in insert mode []
-Stop blinking after 10 times []
+Stop blinking after 10 times [x]
 Cursor blink [x]
 ** Backward_kill_ward
 #+begin_src rust

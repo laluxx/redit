@@ -256,8 +256,7 @@ struct Config {
 }
 
 impl Config {
-    fn new(lua_script_path: Option<&str>) -> LuaResult<Self> {
-        let lua = Lua::new();
+    fn new(lua: &Lua, lua_script_path: Option<&str>) -> LuaResult<Self> {
         let defaults = Config {
             blink_cursor: true,
             show_fringe: true,
@@ -288,6 +287,9 @@ impl Config {
     }
 }
 
+
+
+
 struct Editor {
     mode: Mode,
     dired: Option<Dired>,
@@ -317,6 +319,7 @@ struct Editor {
     force_show_cursor: bool,
     blink_count: u8,
     config: Config,
+    lua: Lua,
 }
 
 impl Editor {
@@ -327,8 +330,8 @@ impl Editor {
         let initial_theme_name = "nature".to_string();
         let current_path = env::current_dir().expect("Failed to determine the current directory");
 
-        // Load configuration from a Lua script or use default values
-        let config = Config::new(config_path)?;
+        let lua = Lua::new();
+        let config = Config::new(&lua, config_path)?;
 
         Ok(Editor {
             mode: Mode::Normal,
@@ -358,31 +361,48 @@ impl Editor {
             last_cursor_toggle: std::time::Instant::now(),
             force_show_cursor: false,
             blink_count: 0,
+            lua,
             config,
         })
     }
 
-    // TODO use tables instead
-    fn eval_buffer(&mut self) -> LuaResult<()> {
-        let lua = Lua::new();
+    fn eval(&mut self, code: &str) -> std::result::Result<(), String> {
+        match self.lua.load(code).exec() {
+            Ok(_) => {
+                let globals = self.lua.globals();
+                self.config.blink_cursor = globals.get("Blink_cursor").unwrap_or(self.config.blink_cursor);
+                self.config.show_fringe = globals.get("Show_fringe").unwrap_or(self.config.show_fringe);
+                self.config.show_line_numbers = globals.get("Show_line_numbers").unwrap_or(self.config.show_line_numbers);
+                self.config.insert_line_cursor = globals.get("Insert_line_cursor").unwrap_or(self.config.insert_line_cursor);
+                self.config.show_hl_line = globals.get("Show_hl_line").unwrap_or(self.config.show_hl_line);
+                self.config.top_scroll_margin = globals.get("Top_scroll_margin").unwrap_or(self.config.top_scroll_margin);
+                self.config.bottom_scroll_margin = globals.get("Bottom_scroll_margin").unwrap_or(self.config.bottom_scroll_margin);
+                self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
+                Ok(())
+            },
+            Err(e) => Err(format!("Lua error: {}", e)),
+        }
+    }
+
+    pub fn eval_region(&mut self) -> std::result::Result<(), String> {
+        let selected_text = self.extract_selected_text();
+        if !selected_text.is_empty() {
+            self.eval(&selected_text)?;
+        } else {
+            return Err("No text selected.".to_string());
+        }
+        Ok(())
+    }
+    
+    pub fn eval_buffer(&mut self) {
         let buffer_content = self.buffer.iter()
             .map(|line| line.iter().collect::<String>())
             .collect::<Vec<String>>().join("\n");
 
-        lua.load(&buffer_content).exec()?;
-        
-        let globals = lua.globals();
-
-        self.config.blink_cursor = globals.get("Blink_cursor").unwrap_or(self.config.blink_cursor);
-        self.config.show_fringe = globals.get("Show_fringe").unwrap_or(self.config.show_fringe);
-        self.config.show_line_numbers = globals.get("Show_line_numbers").unwrap_or(self.config.show_line_numbers);
-        self.config.insert_line_cursor = globals.get("Insert_line_cursor").unwrap_or(self.config.insert_line_cursor);
-        self.config.show_hl_line = globals.get("Show_hl_line").unwrap_or(self.config.show_hl_line);
-        self.config.top_scroll_margin = globals.get("Top_scroll_margin").unwrap_or(self.config.top_scroll_margin);
-        self.config.bottom_scroll_margin = globals.get("Bottom_scroll_margin").unwrap_or(self.config.bottom_scroll_margin);
-        self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
-
-        Ok(())
+        match self.eval(&buffer_content) {
+            Ok(_) => {},
+            Err(err_msg) => self.message(&err_msg),
+        }
     }
 
 
@@ -650,6 +670,39 @@ impl Editor {
         }
     }
 
+    fn extract_selected_text(&self) -> String {
+        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
+            let (start_line, mut start_col) = (start.1 as usize, start.0 as usize);
+            let (end_line, mut end_col) = (end.1 as usize, end.0 as usize);
+
+            // Ensure start_col is always less than or equal to end_col
+            if start_line == end_line && start_col > end_col {
+                std::mem::swap(&mut start_col, &mut end_col);
+            }
+
+            if start_line == end_line {
+                let line = &self.buffer[start_line];
+                line[start_col..=end_col].iter().collect()
+            } else {
+                let mut text = String::new();
+                // Extract from the start line
+                text.push_str(&self.buffer[start_line][start_col..].iter().collect::<String>());
+                // Extract from the middle lines
+                for line in &self.buffer[start_line + 1..end_line] {
+                    text.push('\n');
+                    text.push_str(&line.iter().collect::<String>());
+                }
+                // Ensure end_col is within the bounds of the last line
+                end_col = end_col.min(self.buffer[end_line].len() - 1);
+                // Extract from the end line
+                text.push('\n');
+                text.push_str(&self.buffer[end_line][..=end_col].iter().collect::<String>());
+                text
+            }
+        } else {
+            String::new()
+        }
+    }
     
     fn delete_selection(&mut self) {
         if let (Some(mut start), Some(mut end)) = (self.selection_start, self.selection_end) {
@@ -1892,6 +1945,12 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.selection_start = None;
                 self.selection_end = None;
+            },
+            KeyCode::Char('e') => {
+                match self.eval_region() {
+                    Ok(_) => {}, // Handle success case, if necessary
+                    Err(err_msg) => self.message(&err_msg),
+                }
             },
             KeyCode::Char('x') => {
                 self.delete_selection();

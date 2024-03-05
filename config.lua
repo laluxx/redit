@@ -6,4 +6,4 @@ Insert_line_cursor = false
 Show_hl_line = true
 Top_scroll_margin = 10
 Bottom_scroll_margin = 10
-Blink_limit = 100
+Blink_limit = 10
