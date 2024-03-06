@@ -243,7 +243,7 @@ impl Dired {
 
 use mlua::{Lua, Result as LuaResult};
 
-#[derive(Debug)]
+// #[derive(Debug)]
 struct Config {
     blink_cursor: bool,
     show_fringe: bool,
@@ -253,10 +253,13 @@ struct Config {
     top_scroll_margin: u16,
     bottom_scroll_margin: u16,
     blink_limit: u8,
+    themes: HashMap<String, Theme>,
+    current_theme_name: String,
 }
 
 impl Config {
     fn new(lua: &Lua, lua_script_path: Option<&str>) -> LuaResult<Self> {
+
         let defaults = Config {
             blink_cursor: true,
             show_fringe: true,
@@ -266,11 +269,55 @@ impl Config {
             top_scroll_margin: 10,
             bottom_scroll_margin: 10,
             blink_limit: 10,
+            themes: HashMap::new(),
+            current_theme_name: "default".to_string(),
         };
-
+        
         if let Some(path) = lua_script_path {
             lua.load(&std::fs::read_to_string(path)?).exec()?;
             let globals = lua.globals();
+
+            let lua_themes: mlua::Table = match globals.get("Themes") {
+                Ok(table) => table,
+                Err(_) => lua.create_table().expect("Failed to create a new Lua table"),
+            };
+
+
+            let mut themes = HashMap::new();
+            let initial_theme_name: String = globals.get("Theme").unwrap_or("default".to_string());
+
+            themes.insert("default".to_string(), Theme::default());
+
+            for pair in lua_themes.pairs::<String, mlua::Table>() {
+                let (name, theme_table) = pair?;
+                let theme = Theme {
+                    background_color: hex_to_rgb(&theme_table.get::<_, String>("background_color")?).unwrap(),
+                    text_color: hex_to_rgb(&theme_table.get::<_, String>("text_color")?).unwrap(),
+                    normal_cursor_color: hex_to_rgb(&theme_table.get::<_, String>("normal_cursor_color")?).unwrap(),
+                    insert_cursor_color: hex_to_rgb(&theme_table.get::<_, String>("insert_cursor_color")?).unwrap(),
+                    fringe_color: hex_to_rgb(&theme_table.get::<_, String>("fringe_color")?).unwrap(),
+                    line_numbers_color: hex_to_rgb(&theme_table.get::<_, String>("line_numbers_color")?).unwrap(),
+                    current_line_number_color: hex_to_rgb(&theme_table.get::<_, String>("current_line_number_color")?).unwrap(),
+                    modeline_color: hex_to_rgb(&theme_table.get::<_, String>("modeline_color")?).unwrap(),
+                    modeline_lighter_color: hex_to_rgb(&theme_table.get::<_, String>("modeline_lighter_color")?).unwrap(),
+                    minibuffer_color: hex_to_rgb(&theme_table.get::<_, String>("minibuffer_color")?).unwrap(),
+                    dired_mode_color: hex_to_rgb(&theme_table.get::<_, String>("dired_mode_color")?).unwrap(),
+                    dired_timestamp_color: hex_to_rgb(&theme_table.get::<_, String>("dired_timestamp_color")?).unwrap(),
+                    dired_path_color: hex_to_rgb(&theme_table.get::<_, String>("dired_path_color")?).unwrap(),
+                    dired_size_color: hex_to_rgb(&theme_table.get::<_, String>("dired_size_color")?).unwrap(),
+                    dired_dir_color: hex_to_rgb(&theme_table.get::<_, String>("dired_dir_color")?).unwrap(),
+                    comment_color: hex_to_rgb(&theme_table.get::<_, String>("comment_color")?).unwrap(),
+                    warning_color: hex_to_rgb(&theme_table.get::<_, String>("warning_color")?).unwrap(),
+                    error_color: hex_to_rgb(&theme_table.get::<_, String>("error_color")?).unwrap(),
+                    ok_color: hex_to_rgb(&theme_table.get::<_, String>("ok_color")?).unwrap(),
+                    search_bg_color: hex_to_rgb(&theme_table.get::<_, String>("search_bg_color")?).unwrap(),
+                    visual_mode_color: hex_to_rgb(&theme_table.get::<_, String>("visual_mode_color")?).unwrap(),
+                    selection_color: hex_to_rgb(&theme_table.get::<_, String>("selection_color")?).unwrap(),
+                    hl_line_color: hex_to_rgb(&theme_table.get::<_, String>("hl_line_color")?).unwrap(),
+                };
+                themes.insert(name, theme);
+            }
+
             Ok(Config {
                 blink_cursor: globals.get("Blink_cursor").unwrap_or(defaults.blink_cursor),
                 show_fringe: globals.get("Show_fringe").unwrap_or(defaults.show_fringe),
@@ -280,6 +327,8 @@ impl Config {
                 top_scroll_margin: globals.get("Top_scroll_margin").unwrap_or(defaults.top_scroll_margin),
                 bottom_scroll_margin: globals.get("Bottom_scroll_margin").unwrap_or(defaults.bottom_scroll_margin),
                 blink_limit: globals.get("Blink_limit").unwrap_or(defaults.blink_limit),
+                themes, // Use the loaded themes
+                current_theme_name: initial_theme_name,
             })
         } else {
             Ok(defaults)
@@ -296,8 +345,8 @@ struct Editor {
     cursor_pos: (u16, u16),
     offset: (u16, u16),
     buffer: Vec<Vec<char>>,
-    themes: HashMap<String, Theme>,
-    current_theme_name: String,
+    // themes: HashMap<String, Theme>,
+    // current_theme_name: String,
     minibuffer_active: bool,
     minibuffer_height: u16,
     minibuffer_content: String,
@@ -324,22 +373,16 @@ struct Editor {
 
 impl Editor {
     fn new(config_path: Option<&str>) -> LuaResult<Editor> {
-        let mut themes = HashMap::new();
-        themes.insert("nature".to_string(), Theme::nature());
-        themes.insert("doom-one".to_string(), Theme::doom_one());
-        let initial_theme_name = "nature".to_string();
-        let current_path = env::current_dir().expect("Failed to determine the current directory");
 
         let lua = Lua::new();
         let config = Config::new(&lua, config_path)?;
+        let current_path = env::current_dir().expect("Failed to determine the current directory");
 
         Ok(Editor {
             mode: Mode::Normal,
             cursor_pos: (0, 0),
             offset: (0, 0),
             buffer: vec![vec![]],
-            themes,
-            current_theme_name: initial_theme_name,
             dired: None,
             minibuffer_active: false,
             minibuffer_height: 1,
@@ -378,21 +421,77 @@ impl Editor {
                 self.config.top_scroll_margin = globals.get("Top_scroll_margin").unwrap_or(self.config.top_scroll_margin);
                 self.config.bottom_scroll_margin = globals.get("Bottom_scroll_margin").unwrap_or(self.config.bottom_scroll_margin);
                 self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
+
+                // TODO This should be extracted into a function for code organization
+                // but the borrow checker don't like it so ill do it later
+                let theme_field_to_lua_var = vec![
+                    ("background_color", "Background_color"),
+                    ("text_color", "Text_color"),
+                    ("normal_cursor_color", "Normal_cursor_color"),
+                    ("insert_cursor_color", "Insert_cursor_color"),
+                    ("fringe_color", "Fringe_color"),
+                    ("line_numbers_color", "Line_numbers_color"),
+                    ("current_line_number_color", "Current_line_number_color"),
+                    ("modeline_color", "Modeline_color"),
+                    ("mimibuffer_color", "Minibuffer_color"),
+                    ("dired_mode_color", "Dired_mode_color"),
+                    ("dired_timestamp_color", "Dired_timestamp_color"),
+                    ("dired_path_color", "Dired_path_color"),
+                    ("dired_size_color", "Dired_size_color"),
+                    ("dired_dir_color", "Dired_dir_color"),
+                    ("comment_color", "Comment_color"),
+                    ("warning_color", "Warning_color"),
+                    ("error_color", "Error_color"),
+                    ("ok_color", "Ok_color"),
+                    ("search_bg_color", "Search_bg_color"),
+                    ("visual_mode_color", "Visual_mode_color"),
+                    ("selection_color", "Selection_color"),
+                    ("hl_line_color", "Hl_line_color"),
+                ];
+
+                if let Some(theme) = self.config.themes.get_mut(&self.config.current_theme_name) {
+                    for (field, lua_var) in theme_field_to_lua_var.iter() {
+                        if let Ok(color_str) = globals.get::<_, String>(*lua_var) {
+                            if let Ok(color) = hex_to_rgb(&color_str) {
+                                match *field {
+                                    "background_color" => theme.background_color = color,
+                                    "text_color" => theme.text_color = color,
+                                    "normal_cursor_color" => theme.normal_cursor_color = color,
+                                    "insert_cursor_color" => theme.insert_cursor_color = color,
+                                    "fringe_color" => theme.fringe_color = color,
+                                    "line_numbers_color" => theme.line_numbers_color = color,
+                                    "current_line_number_color" => theme.current_line_number_color = color,
+                                    "modeline_color" => theme.modeline_color = color,
+                                    "modeline_lighter_color" => theme.modeline_lighter_color = color,
+                                    "minibuffer_color" => theme.minibuffer_color = color,
+                                    "dired_mode_color" => theme.dired_mode_color = color,
+                                    "dired_timestamp_color" => theme.dired_timestamp_color = color,
+                                    "dired_path_color" => theme.dired_path_color = color,
+                                    "dired_dir_color" => theme.dired_dir_color = color,
+                                    "comment_color" => theme.comment_color = color,
+                                    "warning_color" => theme.warning_color = color,
+                                    "error_color" => theme.error_color = color,
+                                    "ok_color" => theme.ok_color = color,
+                                    "search_bg_color" => theme.search_bg_color = color,
+                                    "visual_mode_color" => theme.visual_mode_color = color,
+                                    "selection_color" => theme.selection_color = color,
+                                    "hl_line_color" => theme.hl_line_color = color,
+                                    _ => (),
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Ok(())
             },
+
             Err(e) => Err(format!("Lua error: {}", e)),
         }
     }
 
-    pub fn eval_region(&mut self) -> std::result::Result<(), String> {
-        let selected_text = self.extract_selected_text();
-        if !selected_text.is_empty() {
-            self.eval(&selected_text)?;
-        } else {
-            return Err("No text selected.".to_string());
-        }
-        Ok(())
-    }
+
+
     
     pub fn eval_buffer(&mut self) {
         let buffer_content = self.buffer.iter()
@@ -405,20 +504,41 @@ impl Editor {
         }
     }
 
+    pub fn eval_region(&mut self) -> std::result::Result<(), String> {
+        let selected_text = self.extract_selected_text();
+        if !selected_text.is_empty() {
+            self.eval(&selected_text)?;
+        } else {
+            return Err("No text selected.".to_string());
+        }
+        Ok(())
+    }
 
+    pub fn eval_line(&mut self) {
+        let current_line_idx = self.cursor_pos.1 as usize;
+
+        if let Some(line) = self.buffer.get(current_line_idx) {
+            // Convert the current line's characters to a String
+            let line_content = line.iter().collect::<String>();
+            match self.eval(&line_content) {
+                Ok(_) => self.message("Line executed successfully."),
+                Err(err_msg) => self.message(&err_msg),
+            }
+        }
+    }
     
     fn current_theme(&self) -> &Theme {
-        self.themes.get(&self.current_theme_name).expect("Current theme not found")
+        self.config.themes.get(&self.config.current_theme_name).expect("Current theme not found")
     }
 
     fn switch_theme(&mut self, theme_name: &str) {
-        if self.themes.contains_key(theme_name) {
-            self.current_theme_name = theme_name.to_string();
+        if self.config.themes.contains_key(theme_name) {
+            self.config.current_theme_name = theme_name.to_string();
         } else {
             self.message("Theme doesn't exist");
         }
     }
-
+    
     fn quit(&self) {
         let mut stdout = stdout();
         disable_raw_mode().expect("Failed to disable raw mode");
@@ -1462,6 +1582,11 @@ impl Editor {
                     let minibuffer_content = std::mem::take(&mut self.minibuffer_content);
                     if self.minibuffer_prefix == "Switch theme: " {
                         self.switch_theme(&minibuffer_content);
+                    } else if self.minibuffer_prefix == "Eval: "  {
+                        match self.eval(&minibuffer_content) {
+                            Ok(_) => self.message("Code executed successfully."),
+                            Err(err) => self.message(&format!("Error executing code: {}", err)),
+                        };
                     } else if self.minibuffer_prefix == ":" {
                         match minibuffer_content.as_str() {
                             "w" => {
@@ -1828,6 +1953,16 @@ impl Editor {
             } => {
                 self.paste("before");
             },
+            KeyEvent {
+                code: KeyCode::Char(':'), // Assuming ':' because Shift is held down
+                modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ..
+            } => {
+                self.minibuffer_active = true;
+                self.minibuffer_prefix = "Eval: ".to_string();
+                self.minibuffer_content = "".to_string();
+            },
+
 
             KeyEvent {
                 code,
@@ -1859,6 +1994,9 @@ impl Editor {
                 },
                 KeyCode::Esc => {
                     self.highlight_search = false;
+                },
+                KeyCode::Char('e') => {
+                    self.eval_line();
                 },
                 KeyCode::Char('0') => {
                     self.cursor_pos.0 = 0;
@@ -2055,6 +2193,9 @@ impl Editor {
                 KeyCode::Esc => {
                     self.mode = Mode::Normal;
                     self.set_cursor_shape();
+                    // self.eval_buffer();
+                    // TODO Make this an option its helfull for fast iteration
+                    // when messing with lua 
                 },
                 KeyCode::Char(c) => {
                     self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
@@ -2102,7 +2243,8 @@ struct Theme {
 }
 
 impl Theme {
-    fn nature() -> Self {
+
+    fn default() -> Self {
         Theme {
             background_color: hex_to_rgb("#090909").unwrap(),
             text_color: hex_to_rgb("#9995BF").unwrap(),
@@ -2130,33 +2272,6 @@ impl Theme {
         }
     }
 
-    fn doom_one() -> Self {
-        Theme {
-            background_color: hex_to_rgb("#282C34").unwrap(),
-            text_color: hex_to_rgb("#BBC2CF").unwrap(),
-            normal_cursor_color: hex_to_rgb("#51AFEF").unwrap(), 
-            insert_cursor_color: hex_to_rgb("#A9A1E1").unwrap(), 
-            fringe_color: hex_to_rgb("#282C34").unwrap(), 
-            line_numbers_color: hex_to_rgb("#3F444A").unwrap(), 
-            current_line_number_color: hex_to_rgb("#BBC2CF").unwrap(), 
-            modeline_color: hex_to_rgb("#1D2026").unwrap(), 
-            modeline_lighter_color: hex_to_rgb("#252931").unwrap(), 
-            minibuffer_color: hex_to_rgb("#21242B").unwrap(), 
-            dired_mode_color: hex_to_rgb("#C678DD").unwrap(), 
-            dired_timestamp_color: hex_to_rgb("#46D9FC").unwrap(), 
-            dired_path_color: hex_to_rgb("#51AFEF").unwrap(), 
-            dired_size_color: hex_to_rgb("#DA8548").unwrap(), 
-            dired_dir_color: hex_to_rgb("#C678DD").unwrap(), 
-            comment_color: hex_to_rgb("#5B6268").unwrap(), 
-            warning_color: hex_to_rgb("#ECBE7B").unwrap(), 
-            error_color: hex_to_rgb("#FF6C6B").unwrap(), 
-            ok_color: hex_to_rgb("#98BE65").unwrap(), 
-            search_bg_color: hex_to_rgb("#387AA7").unwrap(),
-            visual_mode_color: hex_to_rgb("#C678DD").unwrap(),
-            selection_color: hex_to_rgb("#42444A").unwrap(),
-            hl_line_color: hex_to_rgb("#21242B").unwrap(),
-        }
-    }
 
     fn apply_cursor_color(
         &self,
@@ -2375,6 +2490,8 @@ impl Fzy {
                     "." => ("󰉋", theme.text_color),
                     ".git" => ("", theme.text_color),
                     _ if item.ends_with(".rs") => ("", hex_to_rgb("#DEA584").unwrap()),
+                    _ if item.ends_with(".lua") => ("", theme.normal_cursor_color),
+                    _ if item.ends_with(".org") => ("", hex_to_rgb("#77AA99").unwrap()),
                     _ if item.ends_with(".lock") => ("󰌾", theme.text_color), 
                     _ if item.ends_with(".toml") => ("", theme.text_color),
                     _ if item.ends_with(".json") => ("", hex_to_rgb("#CBCB41").unwrap()),
