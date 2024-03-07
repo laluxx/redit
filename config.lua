@@ -8,8 +8,14 @@ Top_scroll_margin = 10
 Bottom_scroll_margin = 10
 Blink_limit = 10
 
-Theme = "doom_one"
+function c()
+   Normal_cursor_color = "#10B1FE"
+   Insert_cursor_color = "#9F7EFE"
+end
 
+Theme = "nature"
+-- Here you can define your hown themes
+-- TODO if a theme field is missing it crash
 Themes = {
 	nature = {
 		background_color = "#090909",

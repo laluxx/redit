@@ -7,9 +7,10 @@ Can't insert capital letters both in the buffer and in fzy works in the minibuff
 Each buffer should hold its cursor position []
 scroll on paste if necessary [x]
 ** Tomorrow
-Handle tabs properly []
-Rust formatted []
 Themes from lua [x]
+Keybinds from lua []
+Handle tabs characters properly []
+Rust formatter []
 Rich fzy find file with tab key working []
 f key should work on the current working directory in the editor []
 Commands from lua, show which commands come from lua []

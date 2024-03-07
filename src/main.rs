@@ -274,7 +274,7 @@ impl Config {
         };
         
         if let Some(path) = lua_script_path {
-            lua.load(&std::fs::read_to_string(path)?).exec()?;
+            lua.load(&std::fs::read_to_string(path)?).exec()?; // TODO print lua errors
             let globals = lua.globals();
 
             let lua_themes: mlua::Table = match globals.get("Themes") {
@@ -337,9 +337,17 @@ impl Config {
 }
 
 
+struct UndoState {
+    buffer: Vec<Vec<char>>, // Represents the text buffer
+    cursor_pos: (u16, u16), // Cursor position
+    // Include other relevant state info
+}
 
 
 struct Editor {
+    states: Vec<UndoState>, // History of states
+    current_state: usize,     // Index to the current state in the history
+
     mode: Mode,
     dired: Option<Dired>,
     cursor_pos: (u16, u16),
@@ -378,7 +386,14 @@ impl Editor {
         let config = Config::new(&lua, config_path)?;
         let current_path = env::current_dir().expect("Failed to determine the current directory");
 
+        let initial_undo_state = UndoState {
+            buffer: vec![vec![]], // Start with an empty buffer or load from a file
+            cursor_pos: (0, 0),   // Initial cursor position
+        };
+    
         Ok(Editor {
+            states: vec![initial_undo_state], // History starts with the initial state
+            current_state: 0,            // The current (and only) state is at index 0
             mode: Mode::Normal,
             cursor_pos: (0, 0),
             offset: (0, 0),
@@ -409,6 +424,53 @@ impl Editor {
         })
     }
 
+    // TODO Don't discard the branches build a tree like emacs does
+    // TODO BUG cursor position, Vundo
+    fn snapshot(&mut self) {
+        let is_different_from_last_snapshot = if let Some(last_state) = self.states.last() {
+            last_state.buffer != self.buffer || last_state.cursor_pos != self.cursor_pos
+        } else {
+            true
+        };
+
+        if is_different_from_last_snapshot {
+            if self.current_state + 1 < self.states.len() {
+                self.states.truncate(self.current_state + 1);
+            }
+            
+            let state = UndoState {
+                buffer: self.buffer.clone(),
+                cursor_pos: self.cursor_pos,
+            };
+            
+            self.states.push(state);
+            self.current_state = self.states.len() - 1;
+            self.message("Snapshot took");
+        } else {
+            self.message("Snapshot skipped; state unchanged");
+        }
+    }
+
+    fn undo(&mut self) {
+        if self.current_state > 0 {
+            self.current_state -= 1;
+            let state = &self.states[self.current_state];
+            self.buffer = state.buffer.clone();
+            if self.current_state != 0 {
+                self.cursor_pos = state.cursor_pos;
+            }
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.current_state < self.states.len() - 1 {
+            self.current_state += 1;
+            let state = &self.states[self.current_state];
+            self.buffer = state.buffer.clone();
+            self.cursor_pos = state.cursor_pos;
+        }
+    }
+
     fn eval(&mut self, code: &str) -> std::result::Result<(), String> {
         match self.lua.load(code).exec() {
             Ok(_) => {
@@ -421,7 +483,9 @@ impl Editor {
                 self.config.top_scroll_margin = globals.get("Top_scroll_margin").unwrap_or(self.config.top_scroll_margin);
                 self.config.bottom_scroll_margin = globals.get("Bottom_scroll_margin").unwrap_or(self.config.bottom_scroll_margin);
                 self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
-
+                // self.config.current_theme_name = globals.get("Theme").unwrap_or(self.config.current_theme_name.clone()); // TODO BUG
+                
+                
                 // TODO This should be extracted into a function for code organization
                 // but the borrow checker don't like it so ill do it later
                 let theme_field_to_lua_var = vec![
@@ -489,9 +553,6 @@ impl Editor {
             Err(e) => Err(format!("Lua error: {}", e)),
         }
     }
-
-
-
     
     pub fn eval_buffer(&mut self) {
         let buffer_content = self.buffer.iter()
@@ -1526,6 +1587,12 @@ impl Editor {
                 self.buffer.push(Vec::new());
             }
             self.mode = Mode::Normal;
+            // self.snapshot();
+            self.states.clear(); // Clears the undo history
+            self.snapshot(); // Creates a new initial state for undo history
+            self.current_state = 0; // Resets the current state index
+
+
         }
 
         Ok(())
@@ -1812,6 +1879,13 @@ impl Editor {
     fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key {
             KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.redo();
+            },
+            KeyEvent {
                 code: KeyCode::Char('t'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
@@ -1827,6 +1901,7 @@ impl Editor {
                 ..
             } => {
                 self.enter();
+                self.snapshot();
             }
             KeyEvent {
                 code: KeyCode::Char('h'),
@@ -1834,6 +1909,7 @@ impl Editor {
                 ..
             } => {
                 self.backspace();
+                self.snapshot();
             }
             KeyEvent {
                 code: KeyCode::Char('l'),
@@ -1905,6 +1981,7 @@ impl Editor {
                 modifiers: KeyModifiers::SHIFT,
                 ..
             } => {
+                self.snapshot();
                 self.open_above();
             },
             KeyEvent {
@@ -1971,6 +2048,7 @@ impl Editor {
             } => match code {
                 KeyCode::Backspace => {
                     self.backspace();
+                    self.snapshot();
                 },
                 KeyCode::Char('f') => {
                     if let Some(fzy) = &mut self.fzy {
@@ -2002,7 +2080,8 @@ impl Editor {
                     self.cursor_pos.0 = 0;
                 },
                 KeyCode::Char('x') => {
-                    self.delete_char()
+                    self.delete_char();
+                    self.snapshot();
                 },
                 KeyCode::Char('y') => {
                     if let Some(line) = self.buffer.get(self.cursor_pos.1 as usize) {
@@ -2016,6 +2095,7 @@ impl Editor {
                     self.paste("after");
                 },
                 KeyCode::Char('o') => {
+                    self.snapshot();
                     self.open_below();
                 },
                 KeyCode::Char('a') => {
@@ -2038,6 +2118,7 @@ impl Editor {
                 KeyCode::Char('i') => {
                     self.mode = Mode::Insert;
                     self.set_cursor_shape();
+                    self.snapshot();
                     // self.message("--INSERT--"); 
                 },
                 KeyCode::Char('d') => {
@@ -2059,6 +2140,9 @@ impl Editor {
                 },
                 KeyCode::Char('l') | KeyCode::Right => {
                     self.right();
+                },
+                KeyCode::Char('u') => {
+                    self.undo();
                 },
                 KeyCode::Char('q') => {
                     self.quit();
@@ -2193,6 +2277,7 @@ impl Editor {
                 KeyCode::Esc => {
                     self.mode = Mode::Normal;
                     self.set_cursor_shape();
+                    self.snapshot();
                     // self.eval_buffer();
                     // TODO Make this an option its helfull for fast iteration
                     // when messing with lua 
