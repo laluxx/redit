@@ -1,4 +1,5 @@
 use crossterm::{
+
     event::{self, poll, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor, SetAttribute, Attribute},
@@ -344,6 +345,22 @@ struct UndoState {
 }
 
 
+struct Keychords {
+    ctrl_x_pressed: bool,
+}
+
+impl Keychords {
+    fn new() -> Keychords {
+        Keychords {
+            ctrl_x_pressed: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.ctrl_x_pressed = false;
+    }
+}
+
 struct Editor {
     states: Vec<UndoState>, // History of states
     current_state: usize,     // Index to the current state in the history
@@ -377,6 +394,7 @@ struct Editor {
     blink_count: u8,
     config: Config,
     lua: Lua,
+    keychords: Keychords,
 }
 
 impl Editor {
@@ -392,8 +410,8 @@ impl Editor {
         };
     
         Ok(Editor {
-            states: vec![initial_undo_state], // History starts with the initial state
-            current_state: 0,            // The current (and only) state is at index 0
+            states: vec![initial_undo_state],
+            current_state: 0,
             mode: Mode::Normal,
             cursor_pos: (0, 0),
             offset: (0, 0),
@@ -421,6 +439,7 @@ impl Editor {
             blink_count: 0,
             lua,
             config,
+            keychords: Keychords::new(),
         })
     }
 
@@ -445,12 +464,21 @@ impl Editor {
             
             self.states.push(state);
             self.current_state = self.states.len() - 1;
-            self.message("Snapshot took");
+            // self.message("Snapshot took");
         } else {
-            self.message("Snapshot skipped; state unchanged");
+            // self.message("Snapshot skipped; state unchanged");
         }
     }
 
+    // fn undo(&mut self) {
+    //     if self.current_state > 0 {
+    //         self.current_state -= 1;
+    //         let state = &self.states[self.current_state];
+    //         self.buffer = state.buffer.clone();
+    //         self.cursor_pos = state.cursor_pos;
+    //     }
+    // }
+    
     fn undo(&mut self) {
         if self.current_state > 0 {
             self.current_state -= 1;
@@ -458,7 +486,8 @@ impl Editor {
             self.buffer = state.buffer.clone();
             if self.current_state != 0 {
                 self.cursor_pos = state.cursor_pos;
-            }
+                self.adjust_view_to_cursor("")
+            } 
         }
     }
 
@@ -607,17 +636,41 @@ impl Editor {
         std::process::exit(0);
     }
 
-    pub fn buffer_save(&self) -> Result<()> {
+    // pub fn buffer_save(&self) -> Result<()> {
+    //     let content: String = self.buffer.iter()
+    //         .map(|line| line.iter().collect::<String>())
+    //         .collect::<Vec<String>>()
+    //         .join("\n");
+
+    //     fs::write(&self.current_file_path, content)
+    //         .expect("Failed to save file");
+        
+    //     Ok(())
+    // }
+
+    pub fn buffer_save(&mut self) -> Result<()> {
         let content: String = self.buffer.iter()
             .map(|line| line.iter().collect::<String>())
             .collect::<Vec<String>>()
             .join("\n");
 
-        fs::write(&self.current_file_path, content)
-            .expect("Failed to save file");
-        
-        Ok(())
+        // Attempt to write the buffer to the file and handle the result
+        match fs::write(&self.current_file_path, content) {
+            Ok(_) => {
+                // Display a success message with the path of the file saved
+                let message = format!("Wrote {}", self.current_file_path.display());
+                self.message(&message);
+                Ok(())
+            },
+            Err(e) => {
+                // Handle the error by displaying an error message
+                let error_message = format!("Failed to save file: {}", e);
+                self.message(&error_message);
+                Err(e) // Propagate the error
+            },
+        }
     }
+
 
     fn enter(&mut self) {
         let tail = self.buffer[self.cursor_pos.1 as usize].split_off(self.cursor_pos.0 as usize);
@@ -1591,8 +1644,6 @@ impl Editor {
             self.states.clear(); // Clears the undo history
             self.snapshot(); // Creates a new initial state for undo history
             self.current_state = 0; // Resets the current state index
-
-
         }
 
         Ok(())
@@ -1616,6 +1667,10 @@ impl Editor {
                     self.last_cursor_toggle = std::time::Instant::now();
                     self.draw(&mut stdout)?;
                     self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
+
+                    if key.modifiers.is_empty() {
+                        self.keychords.reset();
+                    }
                 }
             }
         }
@@ -1654,6 +1709,14 @@ impl Editor {
                             Ok(_) => self.message("Code executed successfully."),
                             Err(err) => self.message(&format!("Error executing code: {}", err)),
                         };
+                    } else if self.minibuffer_prefix == "Find file: " {
+                        let file_path = PathBuf::from(&minibuffer_content);
+                        self.message(&format!("Current file path: {}", file_path.display()));
+
+                        if let Err(e) = self.open(&file_path, None) {
+                            self.message(&format!("Failed to open file: {}", e));
+                        }
+
                     } else if self.minibuffer_prefix == ":" {
                         match minibuffer_content.as_str() {
                             "w" => {
@@ -1875,9 +1938,38 @@ impl Editor {
         Ok(())
     }
     
-    
     fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key {
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.keychords.ctrl_x_pressed = true;
+                // self.message("C-x-"); // TODO print it only if no keys are pressed after some times
+            },
+            KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                if self.keychords.ctrl_x_pressed { 
+                    if let Err(e) = self.buffer_save() {
+                        self.message(&format!("Failed to save file: {}", e));
+                    }
+                }
+            },
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                if self.keychords.ctrl_x_pressed { 
+                    self.minibuffer_active = true;
+                    self.minibuffer_prefix = "Find file: ".to_string();
+                    self.minibuffer_content = self.current_file_path.display().to_string();
+                }
+            },
             KeyEvent {
                 code: KeyCode::Char('r'),
                 modifiers: KeyModifiers::CONTROL,
@@ -1900,8 +1992,13 @@ impl Editor {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.enter();
-                self.snapshot();
+                if self.keychords.ctrl_x_pressed {
+                    self.dired_jump();
+                    self.keychords.ctrl_x_pressed = false;
+                } else {
+                    self.enter();
+                    self.snapshot();
+                }
             }
             KeyEvent {
                 code: KeyCode::Char('h'),
@@ -1932,11 +2029,13 @@ impl Editor {
                 ..
             } => {
                 // Check if there's an existing search query and display it as a message
-                if !self.search_query.is_empty() {
-                    self.message(&format!("Search query: {}", self.search_query));
-                } else {
-                    self.message("No search query.");
-                }
+                // if !self.search_query.is_empty() {
+                //     self.message(&format!("Search query: {}", self.search_query));
+                // } else {
+                //     self.message("No search query.");
+                // }
+
+                self.message(&format!("Current file path: {}", self.current_file_path.display().to_string()));
             }
             KeyEvent {
                 code: KeyCode::Char('N'),
@@ -1989,7 +2088,9 @@ impl Editor {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
+                // TODO Undo BUG
                 self.kill_line();
+                self.snapshot();
             },
             KeyEvent {
                 code: KeyCode::Char('J'),

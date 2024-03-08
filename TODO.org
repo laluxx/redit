@@ -72,5 +72,3 @@ Tab key, to open a tree of the directory under the cursor without opening a new 
 for files it will show all the methods when lsp will work []
 *** Bugs
 Dired not working as expected when using as "redit main.rs" []
-
-
