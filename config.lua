@@ -1,6 +1,6 @@
 -- config.lua
 Blink_cursor = true
-Show_fringe = true
+Show_fringe = false
 Show_line_numbers = true
 Insert_line_cursor = false
 Show_hl_line = false
@@ -9,11 +9,11 @@ Bottom_scroll_margin = 10
 Blink_limit = 10
 
 function c()
-   Normal_cursor_color = "#10B1FE"
-   Insert_cursor_color = "#9F7EFE"
+	Normal_cursor_color = "#10B1FE"
+	Insert_cursor_color = "#9F7EFE"
 end
 
-Theme = "nature"
+Theme = "tokyonight"
 -- Here you can define your hown themes
 -- TODO if a theme field is missing it crash
 Themes = {
@@ -41,6 +41,8 @@ Themes = {
 		visual_mode_color = "#3B5238",
 		selection_color = "#262626",
 		hl_line_color = "#070707",
+		use_color = "#514B8E",
+        string_color = "#9ECE6A",
 	},
 	doom_one = {
 		background_color = "#282C34",
@@ -66,13 +68,15 @@ Themes = {
 		visual_mode_color = "#C678DD",
 		selection_color = "#42444A",
 		hl_line_color = "#21242B",
+		use_color = "#51AFEF",
+        string_color = "#9ECE6A",
 	},
-	sonokai = {
-		background_color = "#2c2e34",
-		text_color = "#c0caf5",
-		normal_cursor_color = "#f7768e",
-		insert_cursor_color = "#9ece6a",
-		fringe_color = "#2c2e34",
+	gleam = {
+		background_color = "#292D3E",
+		text_color = "#FEFEFC",
+		normal_cursor_color = "#FFAFF3",
+		insert_cursor_color = "#FFAFF3",
+		fringe_color = "#292D3E",
 		line_numbers_color = "#565f89",
 		current_line_number_color = "#c0caf5",
 		modeline_color = "#24283b",
@@ -87,9 +91,38 @@ Themes = {
 		warning_color = "#e0af68",
 		error_color = "#db4b4b",
 		ok_color = "#9ece6a",
-		search_bg_color = "#ea9a97",
+		search_bg_color = "#33467c",
 		visual_mode_color = "#73daca",
-		selection_color = "#33467c",
+		selection_color = "#584355",
 		hl_line_color = "#292e42",
+		use_color = "#FFAFF3",
+        string_color = "#9ECE6A",
+	},
+	tokyonight = {
+		background_color = "#1A1B26",
+		text_color = "#C0CAF5",
+		normal_cursor_color = "#7AA2F7",
+		insert_cursor_color = "#9ECE6A",
+		fringe_color = "#1A1B26",
+		line_numbers_color = "#3B4261",
+		current_line_number_color = "#737AA2",
+		modeline_color = "#292E42",
+		modeline_lighter_color = "#3B4261",
+		minibuffer_color = "#1A1B26",
+		dired_mode_color = "#E0AF68",
+		dired_timestamp_color = "#F7768E",
+		dired_path_color = "#7AA2F7",
+		dired_size_color = "#BB9AF7",
+		dired_dir_color = "#7AA2F7",
+		comment_color = "#565F89",
+		warning_color = "#E0AF68",
+		error_color = "#F7768E",
+		ok_color = "#9ECE6A",
+		search_bg_color = "#3D59A1",
+		visual_mode_color = "#BB9AF7",
+		selection_color = "#283457",
+		hl_line_color = "#292E42",
+        use_color = "#7DCFFF",
+        string_color = "#9ECE6A",
 	},
 }

@@ -1,30 +1,45 @@
 * Editor
+
+Highlight TODo BUG NOTE FIXME just the text, if its like this NOTE: also the bg
 copying should copy to the actual system clipboard too []
 Emacs mode []
 Ability to open the message buffer []
-Make search case insensitive []
+Make search case insensitive [] (config)
 Can't insert capital letters both in the buffer and in fzy works in the minibuffer []
 Each buffer should hold its cursor position []
+Handle tabs characters properly [] (config)
 scroll on paste if necessary [x]
-** Tomorrow
-Themes from lua [x]
-Keybinds from lua []
-Handle tabs characters properly []
+** Lsp
 Rust formatter []
+** Fzy
 Rich fzy find file with tab key working []
 f key should work on the current working directory in the editor []
-Commands from lua, show which commands come from lua []
-Rich commands, each command should have a explanation []
+Rich commands, each command should have an explanation []
+** Treesitter
+Rust syntax highlighting [x]
+Change inside [] 
+Change word [] 
+Tab key to indent like emacs c mode []
+Enter should auto indent [] 
 ** Lua
+Keybinds from lua []
+Commands from lua, show which commands come from lua []
 Hihglight lines with errors when evaluating []
 Define commands as functions in lua and execute them with M-x []
 Call rust editor functions from lua []
+Themes from lua [x]
 ** Cursor
 Cursor pulse []
 Color lerp when changing cursor color []
 Option to blink only in insert mode []
 Stop blinking after 10 times [x]
 Cursor blink [x]
+** Dired
+Preview on the right for files images etc.. []
+icons in dired (optional) []
+Tab key, to open a tree of the directory under the cursor without opening a new buffer
+for files it will show all the methods when lsp will work []
+Dired not working as expected when using as "redit main.rs" []
 ** Backward_kill_ward
 #+begin_src rust
 // TODO CrossTerm don't support ctrl+backspace
@@ -64,11 +79,3 @@ fn backward_kill_word(&mut self) {
     self.cursor_pos.0 = word_start as u16;
 }
 #+end_src
-** Dired
-*** New features
-Preview on the right for files images etc.. []
-icons in dired (optional) []
-Tab key, to open a tree of the directory under the cursor without opening a new buffer
-for files it will show all the methods when lsp will work []
-*** Bugs
-Dired not working as expected when using as "redit main.rs" []

@@ -1,5 +1,4 @@
 use crossterm::{
-
     event::{self, poll, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor, SetAttribute, Attribute},
@@ -7,7 +6,7 @@ use crossterm::{
     cursor::{self, MoveTo},
 };
 
-use std::io::{self, stdout, Stdout, Write};
+use std::{io::{self, stdout, Stdout, Write}, vec};
 use std::io::Result;
 use std::env;
 use std::fs;
@@ -242,6 +241,10 @@ impl Dired {
     }
 }
 
+
+
+
+
 use mlua::{Lua, Result as LuaResult};
 
 // #[derive(Debug)]
@@ -315,6 +318,8 @@ impl Config {
                     visual_mode_color: hex_to_rgb(&theme_table.get::<_, String>("visual_mode_color")?).unwrap(),
                     selection_color: hex_to_rgb(&theme_table.get::<_, String>("selection_color")?).unwrap(),
                     hl_line_color: hex_to_rgb(&theme_table.get::<_, String>("hl_line_color")?).unwrap(),
+                    use_color: hex_to_rgb(&theme_table.get::<_, String>("use_color")?).unwrap(),
+                    string_color: hex_to_rgb(&theme_table.get::<_, String>("string_color")?).unwrap(),
                 };
                 themes.insert(name, theme);
             }
@@ -339,9 +344,8 @@ impl Config {
 
 
 struct UndoState {
-    buffer: Vec<Vec<char>>, // Represents the text buffer
-    cursor_pos: (u16, u16), // Cursor position
-    // Include other relevant state info
+    buffer: Vec<Vec<char>>,
+    cursor_pos: (u16, u16),
 }
 
 
@@ -361,17 +365,142 @@ impl Keychords {
     }
 }
 
-struct Editor {
-    states: Vec<UndoState>, // History of states
-    current_state: usize,     // Index to the current state in the history
 
+#[derive(Debug)]
+struct Highlight {
+    start: usize,
+    end: usize,
+    color: Color,
+}
+
+struct SyntaxHighlighter {
+    parser: tree_sitter::Parser,
+    tree: Option<tree_sitter::Tree>,
+    highlights: Vec<Highlight>,
+}
+
+impl SyntaxHighlighter {
+    fn new() -> Self {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(tree_sitter_rust::language()).expect("Error loading Rust grammar");
+        SyntaxHighlighter {
+            parser,
+            tree: None,
+            highlights:  Vec::new()
+        }
+    }
+    
+    pub fn parse(&mut self, buffer: &[Vec<char>]) {
+        let source_code: String = buffer.iter()
+            .map(|line| line.iter().collect::<String>() + "\n")
+            .collect();
+
+        self.tree = self.parser.parse(&source_code, None);
+    }
+
+    fn get_color_for_node_kind(&self, kind: &str, theme: &Theme) -> Option<Color> {
+        match kind {
+            "let_condition" => Some(theme.dired_path_color),
+            "string_literal" => Some(theme.string_color),
+            "use_declaration" => Some(theme.use_color),
+            _ => None,
+        }
+    }
+
+
+
+    pub fn update_syntax_highlights(&mut self, theme: &Theme) {
+        let mut highlights = std::mem::take(&mut self.highlights); // Temporarily take highlights out
+
+        if let Some(tree) = &self.tree {
+            let root_node = tree.root_node();
+            self.collect_highlights(&root_node, &mut highlights, theme); // Work with the taken highlights
+        }
+
+        self.highlights = highlights; // Put it back
+    }
+
+
+    fn collect_highlights(&self, node: &tree_sitter::Node, highlights: &mut Vec<Highlight>, theme: &Theme) {
+        // Check if the node kind should be highlighted
+        if let Some(color) = self.get_color_for_node_kind(node.kind(), theme) {
+            highlights.push(Highlight {
+                start: node.start_byte(),
+                end: node.end_byte(),
+                color,
+            });
+        }
+
+        // Recursively visit children
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i) {
+                self.collect_highlights(&child, highlights, theme);
+            }
+        }
+    }
+
+    pub fn highlight_line(&self, line_num: usize, buffer: &[Vec<char>], theme: &Theme) -> Vec<Highlight> {
+        let mut highlights = Vec::new();
+        let line_start_byte = self.line_to_byte_index(line_num, buffer);
+        let line_end_byte = if line_num + 1 < buffer.len() {
+            self.line_to_byte_index(line_num + 1, buffer)
+        } else {
+            buffer.iter().map(|line| line.len() + 1).sum::<usize>() - 1 // Adjusting for the last line
+        };
+
+        if let Some(tree) = &self.tree {
+            let root_node = tree.root_node();
+            self.traverse_node_for_highlights(root_node, line_start_byte, line_end_byte, &mut highlights, theme);
+        }
+        highlights
+    }
+
+    fn line_to_byte_index(&self, line_num: usize, buffer: &[Vec<char>]) -> usize {
+        buffer.iter().take(line_num).map(|line| line.len() + 1).sum()
+    }
+
+    fn traverse_node_for_highlights(
+        &self, node: tree_sitter::Node,
+        line_start_byte: usize,
+        line_end_byte: usize,
+        highlights: &mut Vec<Highlight>,
+        theme: &Theme,
+    ) {
+        let start_byte = node.start_byte();
+        let end_byte = node.end_byte();
+        
+        if start_byte < line_end_byte && end_byte > line_start_byte {
+            if let Some(color) = self.get_color_for_node_kind(node.kind(), theme) {
+                let start_pos = std::cmp::max(start_byte, line_start_byte) - line_start_byte;
+                let end_pos = std::cmp::min(end_byte, line_end_byte) - line_start_byte;
+                
+                highlights.push(Highlight {
+                    start: start_pos,
+                    end: end_pos,
+                    color,
+                });
+            }
+            
+            let child_count = node.child_count();
+            for i in 0..child_count {
+                if let Some(child) = node.child(i) {
+                    self.traverse_node_for_highlights(child, line_start_byte, line_end_byte, highlights, theme);
+                }
+            }
+        }
+    }
+}
+
+struct Editor {
+    syntax_highlighter: SyntaxHighlighter,
+    states: Vec<UndoState>, // History of states
+    current_state: usize,
     mode: Mode,
     dired: Option<Dired>,
     cursor_pos: (u16, u16),
     offset: (u16, u16),
     buffer: Vec<Vec<char>>,
-    // themes: HashMap<String, Theme>,
-    // current_theme_name: String,
     minibuffer_active: bool,
     minibuffer_height: u16,
     minibuffer_content: String,
@@ -404,12 +533,16 @@ impl Editor {
         let config = Config::new(&lua, config_path)?;
         let current_path = env::current_dir().expect("Failed to determine the current directory");
 
+
         let initial_undo_state = UndoState {
-            buffer: vec![vec![]], // Start with an empty buffer or load from a file
-            cursor_pos: (0, 0),   // Initial cursor position
+            buffer: vec![vec![]],
+            cursor_pos: (0, 0),
         };
+
+        let syntax_highlighter = SyntaxHighlighter::new();
     
         Ok(Editor {
+            syntax_highlighter,
             states: vec![initial_undo_state],
             current_state: 0,
             mode: Mode::Normal,
@@ -443,6 +576,16 @@ impl Editor {
         })
     }
 
+    pub fn debug_print_ast(&mut self) {
+        if let Some(ref tree) = self.syntax_highlighter.tree {
+            let tree_string = tree.root_node().to_sexp();
+            self.message(&format!("Current AST: {}", tree_string));
+        } else {
+            self.message("No AST available.");
+        }
+    }
+    
+    
     // TODO Don't discard the branches build a tree like emacs does
     // TODO BUG cursor position, Vundo
     fn snapshot(&mut self) {
@@ -466,19 +609,10 @@ impl Editor {
             self.current_state = self.states.len() - 1;
             // self.message("Snapshot took");
         } else {
-            // self.message("Snapshot skipped; state unchanged");
+            // self.message("Snapshot skipped; cursor_pos unchanged");
         }
     }
 
-    // fn undo(&mut self) {
-    //     if self.current_state > 0 {
-    //         self.current_state -= 1;
-    //         let state = &self.states[self.current_state];
-    //         self.buffer = state.buffer.clone();
-    //         self.cursor_pos = state.cursor_pos;
-    //     }
-    // }
-    
     fn undo(&mut self) {
         if self.current_state > 0 {
             self.current_state -= 1;
@@ -1336,47 +1470,120 @@ impl Editor {
         Ok(())
     }
 
+    // ORIGINAL
+    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
+    //     let (width, height) = terminal::size()?;
+    //     let text_color = self.current_theme().text_color;
+    //     let background_color = self.current_theme().background_color;
+    //     let mut start_col_base = 0;
+
+    //     if self.config.show_fringe {
+    //         start_col_base += 2;
+    //     }
+
+    //     if self.config.show_line_numbers {
+    //         start_col_base += 4;
+    //     }
+
+    //     let bottom_exclude = self.minibuffer_height + 1;
+    //     let effective_width = width.saturating_sub(start_col_base);
+
+    //     for (idx, line) in self.buffer.iter().enumerate() {
+    //         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+    //             let line_y = (idx - self.offset.1 as usize) as u16;
+    //             let line_content: String = line.iter().collect::<String>();
+    //             let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
+    //                 // If the line exceeds the effective width, truncate it
+    //                 line_content.chars().take(effective_width as usize).collect::<String>()
+    //             } else {
+    //                 line_content
+    //             };
+
+    //             execute!(
+    //                 stdout,
+    //                 MoveTo(start_col_base, line_y),
+    //                 SetForegroundColor(text_color),
+    //                 SetBackgroundColor(background_color),
+    //                 Print(truncated_line_content)
+    //             )?;
+    //         }
+    //     }
+
+    //     Ok(())
+    // }
+
+
+    // Still flicker
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-        let (width, height) = terminal::size()?;
+        let (width, height) = crossterm::terminal::size()?;
         let text_color = self.current_theme().text_color;
         let background_color = self.current_theme().background_color;
-        let mut start_col_base = 0;
-
-        if self.config.show_fringe {
-            start_col_base += 2;
-        }
-
-        if self.config.show_line_numbers {
-            start_col_base += 4;
-        }
-
         let bottom_exclude = self.minibuffer_height + 1;
-        let effective_width = width.saturating_sub(start_col_base);
+        let visible_lines_range = self.offset.1 as usize..(self.offset.1 + height - bottom_exclude) as usize;
 
-        for (idx, line) in self.buffer.iter().enumerate() {
-            if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-                let line_y = (idx - self.offset.1 as usize) as u16;
-                let line_content: String = line.iter().collect::<String>();
-                let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
-                    // If the line exceeds the effective width, truncate it
-                    line_content.chars().take(effective_width as usize).collect::<String>()
-                } else {
-                    line_content
-                };
+        let mut start_col_base = 0;
+        if self.config.show_fringe { start_col_base += 2; }
+        if self.config.show_line_numbers { start_col_base += 4; }
 
-                execute!(
+        for line_idx in visible_lines_range {
+            let line = match self.buffer.get(line_idx) {
+                Some(line) => line,
+                None => continue,
+            };
+            let line_y = (line_idx as u16).saturating_sub(self.offset.1);
+            let line_highlights = self.syntax_highlighter.highlight_line(line_idx, &self.buffer, self.current_theme());
+
+            // Draw each character
+            for (char_idx, char) in line.iter().enumerate() {
+                let char_color = line_highlights.iter()
+                    .find(|highlight| char_idx >= highlight.start && char_idx < highlight.end)
+                    .map_or(text_color, |highlight| highlight.color);
+
+                // Calculate actual column considering the base offset and character index
+                let current_col = start_col_base + char_idx as u16;
+
+                // Ensure we do not overflow the terminal width
+                if current_col >= width {
+                    break;
+                }
+
+                // Draw the character with its corresponding highlight
+                crossterm::execute!(
                     stdout,
-                    MoveTo(start_col_base, line_y),
-                    SetForegroundColor(text_color),
-                    SetBackgroundColor(background_color),
-                    Print(truncated_line_content)
+                    crossterm::cursor::MoveTo(current_col, line_y),
+                    crossterm::style::SetForegroundColor(char_color),
+                    crossterm::style::Print(*char),
+                    crossterm::style::SetBackgroundColor(background_color)
                 )?;
             }
+
+            // Fill the rest of the line with the background color, if needed
+            if let Some(last_char_col) = line.iter().enumerate().last().map(|(idx, _)| start_col_base + idx as u16 + 1) {
+                if last_char_col < width {
+                    crossterm::execute!(
+                        stdout,
+                        crossterm::cursor::MoveTo(last_char_col, line_y),
+                        crossterm::style::SetBackgroundColor(background_color),
+                        crossterm::style::Print(" ".repeat((width - last_char_col) as usize))
+                    )?;
+                }
+            }
         }
+
+        // Reset terminal colors to defaults after drawing
+        crossterm::execute!(
+            stdout,
+            crossterm::style::SetForegroundColor(text_color),
+            crossterm::style::SetBackgroundColor(background_color),
+            crossterm::style::ResetColor
+        )?;
 
         Ok(())
     }
 
+
+
+        
     fn draw_search_highlight(&self, stdout: &mut io::Stdout) -> Result<()> {
         let (width, height) = size()?;
         let text_color = self.current_theme().text_color;
@@ -1640,14 +1847,20 @@ impl Editor {
                 self.buffer.push(Vec::new());
             }
             self.mode = Mode::Normal;
-            // self.snapshot();
+            self.cursor_pos = (0,0);
+            self.adjust_view_to_cursor("");
             self.states.clear(); // Clears the undo history
             self.snapshot(); // Creates a new initial state for undo history
             self.current_state = 0; // Resets the current state index
+
+            self.syntax_highlighter.parse(&self.buffer);
+            let theme = self.config.themes.get(&self.config.current_theme_name).expect("Current theme not found");
+            self.syntax_highlighter.update_syntax_highlights(theme);
         }
 
         Ok(())
     }
+
 
     fn run(&mut self) -> Result<()> {
         let mut stdout = stdout();
@@ -1968,6 +2181,8 @@ impl Editor {
                     self.minibuffer_active = true;
                     self.minibuffer_prefix = "Find file: ".to_string();
                     self.minibuffer_content = self.current_file_path.display().to_string();
+                } else {
+                    self.config.show_fringe = !self.config.show_fringe;
                 }
             },
             KeyEvent {
@@ -2015,14 +2230,6 @@ impl Editor {
             } => {
                 self.config.show_line_numbers = !self.config.show_line_numbers;
             }
-
-            KeyEvent {
-                code: KeyCode::Char('f'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.config.show_fringe = !self.config.show_fringe;
-            }
             KeyEvent {
                 code: KeyCode::Char('p'),
                 modifiers: KeyModifiers::CONTROL,
@@ -2035,7 +2242,10 @@ impl Editor {
                 //     self.message("No search query.");
                 // }
 
-                self.message(&format!("Current file path: {}", self.current_file_path.display().to_string()));
+                // self.message(&format!("Current file path: {}", self.current_file_path.display().to_string()));
+                
+                let highlights_debug_str = format!("{:?}", self.syntax_highlighter.highlights);
+                self.message(&highlights_debug_str);
             }
             KeyEvent {
                 code: KeyCode::Char('N'),
@@ -2426,6 +2636,9 @@ struct Theme {
     visual_mode_color: Color,
     selection_color: Color,
     hl_line_color: Color,
+    // Syntax highlight colors
+    use_color: Color,
+    string_color: Color,
 }
 
 impl Theme {
@@ -2455,6 +2668,8 @@ impl Theme {
             visual_mode_color: hex_to_rgb("#3B5238").unwrap(),
             selection_color: hex_to_rgb("#262626").unwrap(),
             hl_line_color: hex_to_rgb("#070707").unwrap(),
+            use_color: hex_to_rgb("#514B8E").unwrap(),
+            string_color: hex_to_rgb("#658B5F").unwrap(),
         }
     }
 
@@ -2575,6 +2790,7 @@ impl Fzy {
         register_command!(commands, "save-buffer", Editor::buffer_save);
         register_command!(commands, "dired-jump", Editor::dired_jump);
         register_command!(commands, "eval-buffer", Editor::eval_buffer);
+        register_command!(commands, "debug-ast", Editor::debug_print_ast);
         Fzy {
             active: false,
             items: Vec::new(),

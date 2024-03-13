@@ -11,8 +11,8 @@ chrono = "0.4.34"
 crossterm = "0.27.0"
 directories = "5.0.1"
 mlua = { version = "0.7.0", features = ["lua54"] }
-# tree-sitter = "0.20.0"
-# tree-sitter-rust = "0.20.4"
+tree-sitter = "0.20.0"
+tree-sitter-rust = "0.20.4"
 
 [build-dependencies]
 directories = "5.0.1"
