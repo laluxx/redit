@@ -7,13 +7,16 @@ Show_hl_line = false
 Top_scroll_margin = 10
 Bottom_scroll_margin = 10
 Blink_limit = 10
+Indentation = 4
+Electric_pair_mode = true
+
 
 function c()
 	Normal_cursor_color = "#10B1FE"
 	Insert_cursor_color = "#9F7EFE"
 end
 
-Theme = "tokyonight"
+Theme = "dark" -- WAL
 -- Here you can define your hown themes
 -- TODO if a theme field is missing it crash
 Themes = {
@@ -125,4 +128,32 @@ Themes = {
         use_color = "#7DCFFF",
         string_color = "#9ECE6A",
 	},
+    
+    dark = {
+       background_color = "#18181B",
+       text_color = "#E4E4E8",
+       normal_cursor_color = "#E4E4E8",
+       insert_cursor_color = "#80BBB5",
+       fringe_color = "#18181B",
+       line_numbers_color = "#545c5e",
+       current_line_number_color = "#919a9c",
+       modeline_color = "#131316",
+       modeline_lighter_color = "#222225",
+       minibuffer_color = "#18181B",
+       dired_mode_color = "#968CC7",
+       dired_timestamp_color = "#9d81ba",
+       dired_path_color = "#80bcb6",
+       dired_size_color = "#cd5c60",
+       dired_dir_color = "#4d9391",
+       comment_color = "#545c5e",
+       warning_color = "#dbac66",
+       error_color = "#cd5c60",
+       ok_color = "#6fb593",
+       search_bg_color = "#303035",
+       visual_mode_color = "#CD9575",
+       selection_color = "#2E403B",
+       hl_line_color = "#222225",
+       use_color = "#4d9391",
+       string_color = "#6fb593",
+    },
 }

@@ -40,7 +40,6 @@ struct Dired {
 }
 
 impl Dired {
-
     fn new(current_path: PathBuf, focus: Option<&str>) -> io::Result<Self> {
         let entries = Dired::list_directory_contents(&current_path)?;
         let mut cursor_pos = if entries.len() == 0 { 0 } else { 2 }; // Skip '.' and '..'
@@ -259,6 +258,8 @@ struct Config {
     blink_limit: u8,
     themes: HashMap<String, Theme>,
     current_theme_name: String,
+    indentation: usize,
+    electric_pair_mode: bool,
 }
 
 impl Config {
@@ -275,6 +276,8 @@ impl Config {
             blink_limit: 10,
             themes: HashMap::new(),
             current_theme_name: "default".to_string(),
+            indentation: 4,
+            electric_pair_mode: true,
         };
         
         if let Some(path) = lua_script_path {
@@ -288,9 +291,10 @@ impl Config {
 
 
             let mut themes = HashMap::new();
-            let initial_theme_name: String = globals.get("Theme").unwrap_or("default".to_string());
+            themes.insert("wal".to_string(), Theme::wal());
+            let initial_theme_name: String = globals.get("Theme").unwrap_or("wal".to_string());
 
-            themes.insert("default".to_string(), Theme::default());
+
 
             for pair in lua_themes.pairs::<String, mlua::Table>() {
                 let (name, theme_table) = pair?;
@@ -335,6 +339,8 @@ impl Config {
                 blink_limit: globals.get("Blink_limit").unwrap_or(defaults.blink_limit),
                 themes, // Use the loaded themes
                 current_theme_name: initial_theme_name,
+                indentation: globals.get("Indentation").unwrap_or(defaults.indentation),
+                electric_pair_mode: globals.get("Electric_pair_mode").unwrap_or(defaults.electric_pair_mode),
             })
         } else {
             Ok(defaults)
@@ -618,10 +624,13 @@ impl Editor {
             self.current_state -= 1;
             let state = &self.states[self.current_state];
             self.buffer = state.buffer.clone();
+            self.cursor_pos = state.cursor_pos;
             if self.current_state != 0 {
-                self.cursor_pos = state.cursor_pos;
-                self.adjust_view_to_cursor("")
-            } 
+                self.adjust_view_to_cursor("");
+            }
+            self.message_undo_tree();
+        } else {
+            self.message("No more undos available.");
         }
     }
 
@@ -631,7 +640,24 @@ impl Editor {
             let state = &self.states[self.current_state];
             self.buffer = state.buffer.clone();
             self.cursor_pos = state.cursor_pos;
+            self.adjust_view_to_cursor("");
+            self.message_undo_tree();
+        } else {
+            self.message("No more redos available.");
         }
+    }
+
+    fn message_undo_tree(&mut self) {
+        let mut display = String::new();
+        for i in 0..self.states.len() {
+            if i == self.current_state {
+                display.push('●');   // ■ TODO make this a configuration
+            } else {
+                display.push('◯');  // □ TODO make this a configuration 
+            }
+            display.push('—');  // TODO make this a configuration
+        }
+        self.message(&display);
     }
 
     fn eval(&mut self, code: &str) -> std::result::Result<(), String> {
@@ -770,18 +796,6 @@ impl Editor {
         std::process::exit(0);
     }
 
-    // pub fn buffer_save(&self) -> Result<()> {
-    //     let content: String = self.buffer.iter()
-    //         .map(|line| line.iter().collect::<String>())
-    //         .collect::<Vec<String>>()
-    //         .join("\n");
-
-    //     fs::write(&self.current_file_path, content)
-    //         .expect("Failed to save file");
-        
-    //     Ok(())
-    // }
-
     pub fn buffer_save(&mut self) -> Result<()> {
         let content: String = self.buffer.iter()
             .map(|line| line.iter().collect::<String>())
@@ -804,7 +818,6 @@ impl Editor {
             },
         }
     }
-
 
     fn enter(&mut self) {
         let tail = self.buffer[self.cursor_pos.1 as usize].split_off(self.cursor_pos.0 as usize);
@@ -832,16 +845,38 @@ impl Editor {
 
     fn backspace(&mut self) {
         if self.cursor_pos.0 > 0 {
-            self.buffer[self.cursor_pos.1 as usize].remove((self.cursor_pos.0 - 1) as usize);
-            self.cursor_pos.0 -= 1;
+            let line_index = self.cursor_pos.1 as usize;
+            let char_index = (self.cursor_pos.0 - 1) as usize;
+
+            // Check if electric pair mode is enabled and handle paired deletion
+            if self.config.electric_pair_mode &&
+                char_index < self.buffer[line_index].len() - 1 && // Ensure there's a character after the one to be deleted
+                matches!(self.buffer[line_index][char_index], '{' | '[' | '(' | '"' | '\'') &&
+                ((self.buffer[line_index][char_index] == '{' && self.buffer[line_index][char_index + 1] == '}') ||
+                 (self.buffer[line_index][char_index] == '[' && self.buffer[line_index][char_index + 1] == ']') ||
+                 (self.buffer[line_index][char_index] == '(' && self.buffer[line_index][char_index + 1] == ')') ||
+                 (self.buffer[line_index][char_index] == '"' && self.buffer[line_index][char_index + 1] == '"') ||
+                 (self.buffer[line_index][char_index] == '\'' && self.buffer[line_index][char_index + 1] == '\'')) {
+                    
+                    // Remove both the opening and the closing characters
+                    self.buffer[line_index].remove(char_index + 1); // Remove the closing first to keep indices correct
+                    self.buffer[line_index].remove(char_index); // Now remove the opening
+                    self.cursor_pos.0 -= 1; // Adjust the cursor position
+                } else {
+                    // Normal backspace operation
+                    self.buffer[line_index].remove(char_index);
+                    self.cursor_pos.0 -= 1;
+                }
         } else if self.cursor_pos.1 > 0 {
             // Handle removing an entire line and moving up
-            let current_line = self.buffer.remove(self.cursor_pos.1 as usize);
             self.cursor_pos.1 -= 1;
             self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+            let current_line = self.buffer.remove(self.cursor_pos.1 as usize);
             self.buffer[self.cursor_pos.1 as usize].extend(current_line);
         }
     }
+
+
 
     fn delete_char(&mut self) {
         if !self.buffer[self.cursor_pos.1 as usize].is_empty() {
@@ -918,6 +953,85 @@ impl Editor {
             self.cursor_pos.0 += 1;
         }
     }
+
+
+
+    fn indent(&mut self) {
+        let cursor_row = self.cursor_pos.1 as usize;
+        let mut brace_level = 0;
+
+        // Calculate the brace level up to the current line
+        for line in self.buffer.iter().take(cursor_row + 1) {
+            for &c in line.iter() {
+                if c == '{' {
+                    brace_level += 1;
+                } else if c == '}' {
+                    if brace_level > 0 {
+                        brace_level -= 1; // Safely decrement brace level
+                    }
+                }
+            }
+        }
+
+        let current_line = &self.buffer[cursor_row];
+        let first_non_whitespace = current_line.iter().position(|&c| !c.is_whitespace()).unwrap_or(current_line.len());
+        let decrease_indent = current_line.get(first_non_whitespace).map_or(false, |&c| c == '}');
+        if decrease_indent && brace_level > 0 {
+            brace_level -= 1; // Decrease brace level if the line starts with a '}'
+        }
+
+        let required_indentation = brace_level * self.config.indentation;
+
+        // Create a new line with the correct indentation followed by the rest of the line after initial whitespace
+        let mut new_line = vec![' '; required_indentation];
+        new_line.extend_from_slice(&current_line[first_non_whitespace..]);
+
+        // Replace the old line with the new one
+        self.buffer[cursor_row] = new_line;
+
+        // Move the cursor to the first non-whitespace character on the line
+        self.cursor_pos.0 = required_indentation as u16;
+    }
+
+    // fn indent(&mut self) {
+    //     let cursor_row = self.cursor_pos.1 as usize;
+    //     let mut brace_level = 0;
+
+    //     // Calculate the brace level up to the current line
+    //     for line in self.buffer.iter().take(cursor_row) {
+    //         brace_level += line.iter().filter(|&&c| c == '{').count();
+    //         brace_level -= line.iter().filter(|&&c| c == '}').count();
+    //         if brace_level > 0 {
+    //             brace_level = brace_level - 1; // Decrement brace level to handle line starts with '}'
+    //         }
+    //     }
+
+    //     let current_line = &self.buffer[cursor_row];
+    //     let first_non_whitespace = current_line.iter().position(|&c| !c.is_whitespace()).unwrap_or(0);
+    //     let decrease_indent = current_line.get(first_non_whitespace) == Some(&'}');
+    //     if decrease_indent {
+    //         if brace_level > 0 {
+    //             brace_level -= 1;
+    //         }
+    //     }
+
+    //     let required_indentation = brace_level * self.config.indentation;
+    //     let current_indentation = current_line.iter().take_while(|&&c| c == ' ').count();
+
+    //     // Adjust indentation
+    //     if current_indentation < required_indentation {
+    //         let additional_spaces = required_indentation - current_indentation;
+    //         let new_indent: String = std::iter::repeat(' ').take(additional_spaces).collect();
+    //         self.buffer[cursor_row].splice(..current_indentation, new_indent.chars());
+    //     } else if current_indentation > required_indentation {
+    //         self.buffer[cursor_row].drain(..current_indentation).skip(required_indentation);
+    //     }
+
+    //     // Adjust cursor position to the start of the text or after the indentation
+    //     self.cursor_pos.0 = required_indentation as u16;
+    // }
+
+
 
     fn adjust_view_to_cursor(&mut self, adjustment: &str) {
         let (_, height) = terminal::size().unwrap();
@@ -1192,6 +1306,37 @@ impl Editor {
             }
         }
     }
+
+
+    pub fn mwim_beginning(&mut self) {
+        let line = &self.buffer[self.cursor_pos.1 as usize];
+        let first_non_whitespace = line.iter()
+            .position(|c| !c.is_whitespace())
+            .unwrap_or(0) as u16;
+
+        if self.cursor_pos.0 == first_non_whitespace {
+            self.cursor_pos.0 = 0;
+        } else {
+            self.cursor_pos.0 = first_non_whitespace;
+        }
+        self.adjust_view_to_cursor("center");
+    }
+
+    pub fn mwim_end(&mut self) {
+        let line = &self.buffer[self.cursor_pos.1 as usize];
+        let last_non_whitespace = line.iter()
+            .rposition(|c| !c.is_whitespace())
+            .map_or(line.len(), |pos| pos + 1) as u16;
+
+        if self.cursor_pos.0 == last_non_whitespace {
+            self.cursor_pos.0 = line.len() as u16;
+        } else {
+            self.cursor_pos.0 = last_non_whitespace;
+        }
+        self.adjust_view_to_cursor("center");
+    }
+
+
 
     
     fn open_below(&mut self) {
@@ -1471,115 +1616,115 @@ impl Editor {
     }
 
     // ORIGINAL
-    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-    //     let (width, height) = terminal::size()?;
-    //     let text_color = self.current_theme().text_color;
-    //     let background_color = self.current_theme().background_color;
-    //     let mut start_col_base = 0;
-
-    //     if self.config.show_fringe {
-    //         start_col_base += 2;
-    //     }
-
-    //     if self.config.show_line_numbers {
-    //         start_col_base += 4;
-    //     }
-
-    //     let bottom_exclude = self.minibuffer_height + 1;
-    //     let effective_width = width.saturating_sub(start_col_base);
-
-    //     for (idx, line) in self.buffer.iter().enumerate() {
-    //         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-    //             let line_y = (idx - self.offset.1 as usize) as u16;
-    //             let line_content: String = line.iter().collect::<String>();
-    //             let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
-    //                 // If the line exceeds the effective width, truncate it
-    //                 line_content.chars().take(effective_width as usize).collect::<String>()
-    //             } else {
-    //                 line_content
-    //             };
-
-    //             execute!(
-    //                 stdout,
-    //                 MoveTo(start_col_base, line_y),
-    //                 SetForegroundColor(text_color),
-    //                 SetBackgroundColor(background_color),
-    //                 Print(truncated_line_content)
-    //             )?;
-    //         }
-    //     }
-
-    //     Ok(())
-    // }
-
-
-    // Still flicker
     fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-        let (width, height) = crossterm::terminal::size()?;
+        let (width, height) = terminal::size()?;
         let text_color = self.current_theme().text_color;
         let background_color = self.current_theme().background_color;
-        let bottom_exclude = self.minibuffer_height + 1;
-        let visible_lines_range = self.offset.1 as usize..(self.offset.1 + height - bottom_exclude) as usize;
-
         let mut start_col_base = 0;
-        if self.config.show_fringe { start_col_base += 2; }
-        if self.config.show_line_numbers { start_col_base += 4; }
 
-        for line_idx in visible_lines_range {
-            let line = match self.buffer.get(line_idx) {
-                Some(line) => line,
-                None => continue,
-            };
-            let line_y = (line_idx as u16).saturating_sub(self.offset.1);
-            let line_highlights = self.syntax_highlighter.highlight_line(line_idx, &self.buffer, self.current_theme());
+        if self.config.show_fringe {
+            start_col_base += 2;
+        }
 
-            // Draw each character
-            for (char_idx, char) in line.iter().enumerate() {
-                let char_color = line_highlights.iter()
-                    .find(|highlight| char_idx >= highlight.start && char_idx < highlight.end)
-                    .map_or(text_color, |highlight| highlight.color);
+        if self.config.show_line_numbers {
+            start_col_base += 4;
+        }
 
-                // Calculate actual column considering the base offset and character index
-                let current_col = start_col_base + char_idx as u16;
+        let bottom_exclude = self.minibuffer_height + 1;
+        let effective_width = width.saturating_sub(start_col_base);
 
-                // Ensure we do not overflow the terminal width
-                if current_col >= width {
-                    break;
-                }
+        for (idx, line) in self.buffer.iter().enumerate() {
+            if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+                let line_y = (idx - self.offset.1 as usize) as u16;
+                let line_content: String = line.iter().collect::<String>();
+                let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
+                    // If the line exceeds the effective width, truncate it
+                    line_content.chars().take(effective_width as usize).collect::<String>()
+                } else {
+                    line_content
+                };
 
-                // Draw the character with its corresponding highlight
-                crossterm::execute!(
+                execute!(
                     stdout,
-                    crossterm::cursor::MoveTo(current_col, line_y),
-                    crossterm::style::SetForegroundColor(char_color),
-                    crossterm::style::Print(*char),
-                    crossterm::style::SetBackgroundColor(background_color)
+                    MoveTo(start_col_base, line_y),
+                    SetForegroundColor(text_color),
+                    SetBackgroundColor(background_color),
+                    Print(truncated_line_content)
                 )?;
-            }
-
-            // Fill the rest of the line with the background color, if needed
-            if let Some(last_char_col) = line.iter().enumerate().last().map(|(idx, _)| start_col_base + idx as u16 + 1) {
-                if last_char_col < width {
-                    crossterm::execute!(
-                        stdout,
-                        crossterm::cursor::MoveTo(last_char_col, line_y),
-                        crossterm::style::SetBackgroundColor(background_color),
-                        crossterm::style::Print(" ".repeat((width - last_char_col) as usize))
-                    )?;
-                }
             }
         }
 
-        // Reset terminal colors to defaults after drawing
-        crossterm::execute!(
-            stdout,
-            crossterm::style::SetForegroundColor(text_color),
-            crossterm::style::SetBackgroundColor(background_color),
-            crossterm::style::ResetColor
-        )?;
-
         Ok(())
     }
+
+
+    // // Still flicker
+    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
+    //     let (width, height) = crossterm::terminal::size()?;
+    //     let text_color = self.current_theme().text_color;
+    //     let background_color = self.current_theme().background_color;
+    //     let bottom_exclude = self.minibuffer_height + 1;
+    //     let visible_lines_range = self.offset.1 as usize..(self.offset.1 + height - bottom_exclude) as usize;
+
+    //     let mut start_col_base = 0;
+    //     if self.config.show_fringe { start_col_base += 2; }
+    //     if self.config.show_line_numbers { start_col_base += 4; }
+
+    //     for line_idx in visible_lines_range {
+    //         let line = match self.buffer.get(line_idx) {
+    //             Some(line) => line,
+    //             None => continue,
+    //         };
+    //         let line_y = (line_idx as u16).saturating_sub(self.offset.1);
+    //         let line_highlights = self.syntax_highlighter.highlight_line(line_idx, &self.buffer, self.current_theme());
+
+    //         // Draw each character
+    //         for (char_idx, char) in line.iter().enumerate() {
+    //             let char_color = line_highlights.iter()
+    //                 .find(|highlight| char_idx >= highlight.start && char_idx < highlight.end)
+    //                 .map_or(text_color, |highlight| highlight.color);
+
+    //             // Calculate actual column considering the base offset and character index
+    //             let current_col = start_col_base + char_idx as u16;
+
+    //             // Ensure we do not overflow the terminal width
+    //             if current_col >= width {
+    //                 break;
+    //             }
+
+    //             // Draw the character with its corresponding highlight
+    //             crossterm::execute!(
+    //                 stdout,
+    //                 crossterm::cursor::MoveTo(current_col, line_y),
+    //                 crossterm::style::SetForegroundColor(char_color),
+    //                 crossterm::style::Print(*char),
+    //                 crossterm::style::SetBackgroundColor(background_color)
+    //             )?;
+    //         }
+
+    //         // Fill the rest of the line with the background color, if needed
+    //         if let Some(last_char_col) = line.iter().enumerate().last().map(|(idx, _)| start_col_base + idx as u16 + 1) {
+    //             if last_char_col < width {
+    //                 crossterm::execute!(
+    //                     stdout,
+    //                     crossterm::cursor::MoveTo(last_char_col, line_y),
+    //                     crossterm::style::SetBackgroundColor(background_color),
+    //                     crossterm::style::Print(" ".repeat((width - last_char_col) as usize))
+    //                 )?;
+    //             }
+    //         }
+    //     }
+
+    //     // Reset terminal colors to defaults after drawing
+    //     crossterm::execute!(
+    //         stdout,
+    //         crossterm::style::SetForegroundColor(text_color),
+    //         crossterm::style::SetBackgroundColor(background_color),
+    //         crossterm::style::ResetColor
+    //     )?;
+
+    //     Ok(())
+    // }
 
 
 
@@ -2161,6 +2306,15 @@ impl Editor {
                 self.keychords.ctrl_x_pressed = true;
                 // self.message("C-x-"); // TODO print it only if no keys are pressed after some times
             },
+
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.indent();
+            },
+
             KeyEvent {
                 code: KeyCode::Char('s'),
                 modifiers: KeyModifiers::CONTROL,
@@ -2534,82 +2688,146 @@ impl Editor {
         Ok(())
     }
 
-    fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
-        match key {
-            KeyEvent {
-                code: KeyCode::Char('v'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.paste("before");
-            },
-            KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.down();
-            },
-            KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.up();
-            },
-            KeyEvent {
-                code: KeyCode::Char('h'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.backspace();
-            },
-            KeyEvent {
-                code: KeyCode::Char('l'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.right();
-            },
-            KeyEvent {
-                code: KeyCode::Char('f'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.searching = true;
-                self.minibuffer_active = true;
-                self.minibuffer_prefix = "Search:".to_string();
-            },
-            KeyEvent {
-                code,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => match code {
-                KeyCode::Esc => {
-                    self.mode = Mode::Normal;
-                    self.set_cursor_shape();
-                    self.snapshot();
-                    // self.eval_buffer();
-                    // TODO Make this an option its helfull for fast iteration
-                    // when messing with lua 
+
+        fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Tab,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    self.indent();
                 },
-                KeyCode::Char(c) => {
-                    self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
-                    self.cursor_pos.0 += 1;
+                KeyEvent {
+                    code: KeyCode::Char('a'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.mwim_beginning();
                 },
-                KeyCode::Backspace => {
-                    self.backspace();
+                KeyEvent {
+                    code: KeyCode::Char('e'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.mwim_end();
                 },
-                KeyCode::Enter => {
-                    self.enter();
+                KeyEvent {
+                    code: KeyCode::Char('v'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.paste("before");
                 },
+                KeyEvent {
+                    code: KeyCode::Char('n'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.down();
+                },
+                KeyEvent {
+                    code: KeyCode::Char('p'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.up();
+                },
+                KeyEvent {
+                    code: KeyCode::Char('b'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.left();
+                },
+                KeyEvent {
+                    code: KeyCode::Char('f'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.right();
+                },
+                KeyEvent {
+                    code: KeyCode::Char('s'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.right();
+                    self.searching = true;
+                    self.minibuffer_active = true;
+                    self.minibuffer_prefix = "Search:".to_string();
+                },
+                
+                KeyEvent {
+                    code,
+                    modifiers,
+                    ..
+                } => match (code, modifiers) {
+                    (KeyCode::Esc, KeyModifiers::NONE) => {
+                        self.mode = Mode::Normal;
+                        self.set_cursor_shape();
+                        self.snapshot();
+                    },
+
+                    // (KeyCode::Char(c), KeyModifiers::SHIFT) => {
+                    //     // Handle uppercase letters
+                    //     let uppercase = c.to_ascii_uppercase();
+                    //     self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, uppercase);
+                    //     self.cursor_pos.0 += 1;
+                    // },
+                    
+                    // (KeyCode::Char(c), KeyModifiers::NONE) => {
+                    //     // Handle lowercase and other characters without modifiers
+                    //     self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
+                    //     self.cursor_pos.0 += 1;
+                    // },
+
+
+                    (KeyCode::Char(c), KeyModifiers::SHIFT) => {
+                        // Handle uppercase letters
+                        let uppercase = c.to_ascii_uppercase();
+                        self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, uppercase);
+                        self.cursor_pos.0 += 1;
+                    },
+                    
+                    (KeyCode::Char(c), KeyModifiers::NONE) => {
+                        // Handle lowercase and other characters without modifiers
+                        if self.config.electric_pair_mode && "([{'\"".contains(c) {
+                            let closing_char = match c {
+                                '(' => ')',
+                                '[' => ']',
+                                '{' => '}',
+                                '"' => '"',
+                                '\'' => '\'',
+                                _ => c,
+                            };
+                            self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
+                            self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize + 1, closing_char);
+                            self.cursor_pos.0 += 1;  // Move cursor between the pair
+                        } else {
+                            self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
+                            self.cursor_pos.0 += 1;
+                        }
+                    },
+
+
+                    (KeyCode::Backspace, KeyModifiers::NONE) => {
+                        self.backspace();
+                    },
+                    
+                    (KeyCode::Enter, KeyModifiers::NONE) => {
+                        self.enter();
+                    },
+                    _ => {}
+                },
+
+                
                 _ => {}
-            },
-            _ => {}
+            }
+            Ok(())
         }
-        Ok(())
     }
-}
+
 
 
 struct Theme {
@@ -2643,7 +2861,46 @@ struct Theme {
 
 impl Theme {
 
-    fn default() -> Self {
+    fn wal() -> Self {
+        match load_wal_colors() {
+            Ok(colors) if !colors.is_empty() => {
+                Theme::from_wal_colors(colors)
+            },
+            _ => Theme::fallback()
+        }
+    }
+
+    fn from_wal_colors(colors: Vec<Color>) -> Self {
+        Theme {
+            background_color: colors.get(0).cloned().unwrap(),
+            text_color: colors.get(7).cloned().unwrap(),
+            normal_cursor_color: colors.get(12).cloned().unwrap(),
+            insert_cursor_color: colors.get(13).cloned().unwrap(),
+            fringe_color: colors.get(4).cloned().unwrap(),
+            line_numbers_color: colors.get(8).cloned().unwrap(),
+            current_line_number_color: colors.get(5).cloned().unwrap(),
+            modeline_color: colors.get(6).cloned().unwrap(),
+            modeline_lighter_color: colors.get(8).cloned().unwrap(),
+            minibuffer_color: colors.get(0).cloned().unwrap(),
+            dired_mode_color: colors.get(12).cloned().unwrap(),
+            dired_timestamp_color: colors.get(11).cloned().unwrap(),
+            dired_path_color: colors.get(12).cloned().unwrap(),
+            dired_size_color: colors.get(14).cloned().unwrap(),
+            dired_dir_color: colors.get(12).cloned().unwrap(),
+            comment_color: colors.get(8).cloned().unwrap(),
+            warning_color: colors.get(11).cloned().unwrap(),
+            error_color: colors.get(9).cloned().unwrap(),
+            ok_color: colors.get(2).cloned().unwrap(),
+            search_bg_color: colors.get(8).cloned().unwrap(),
+            visual_mode_color: colors.get(5).cloned().unwrap(),
+            selection_color: colors.get(5).cloned().unwrap(),
+            hl_line_color: colors.get(8).cloned().unwrap(),
+            use_color: colors.get(12).cloned().unwrap(),
+            string_color: colors.get(10).cloned().unwrap(),
+        }
+    }
+
+    fn fallback() -> Self {
         Theme {
             background_color: hex_to_rgb("#090909").unwrap(),
             text_color: hex_to_rgb("#9995BF").unwrap(),
@@ -2672,7 +2929,6 @@ impl Theme {
             string_color: hex_to_rgb("#658B5F").unwrap(),
         }
     }
-
 
     fn apply_cursor_color(
         &self,
@@ -2716,6 +2972,8 @@ impl Theme {
     }
 }
 
+
+
 use directories::BaseDirs;
     
 fn get_config_path() -> Option<PathBuf> {
@@ -2727,7 +2985,22 @@ fn get_config_path() -> Option<PathBuf> {
     }
     None
 }
-    
+
+fn load_wal_colors() -> io::Result<Vec<Color>> {
+    if let Some(base_dirs) = directories::BaseDirs::new() {
+        let wal_colors_path = base_dirs.home_dir().join(".cache/wal/colors");
+        if wal_colors_path.exists() {
+            let content = fs::read_to_string(wal_colors_path)?;
+            let colors = content.lines()
+                .map(|line| hex_to_rgb(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)))
+                .collect::<io::Result<Vec<Color>>>();
+            return colors;
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "WAL colors file not found"))
+}
+
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -2742,9 +3015,6 @@ fn main() -> Result<()> {
     editor.run()
 }
 
-
-
-    
 fn hex_to_rgb(hex: &str) -> std::result::Result<Color, &'static str> {
     if hex.starts_with('#') && hex.len() == 7 {
         let r = u8::from_str_radix(&hex[1..3], 16).map_err(|_| "Invalid hex format")?;
@@ -2941,6 +3211,26 @@ impl Fzy {
         let mut state_changed = false;
 
         match key {
+            KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                if self.selection_index < self.items.len() - 1 { 
+                    self.selection_index += 1;
+                }
+            },
+
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                if self.selection_index > 0 {
+                    self.selection_index -= 1;
+                }
+            },
+
             KeyEvent {
                 code: KeyCode::Char('j'),
                 modifiers: KeyModifiers::CONTROL,
