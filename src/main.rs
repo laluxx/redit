@@ -260,6 +260,9 @@ struct Config {
     current_theme_name: String,
     indentation: usize,
     electric_pair_mode: bool,
+    tree_node: char,
+    current_tree_node: char,
+    tree_node_separator: char,
 }
 
 impl Config {
@@ -278,6 +281,9 @@ impl Config {
             current_theme_name: "default".to_string(),
             indentation: 4,
             electric_pair_mode: true,
+            tree_node: '◯',
+            current_tree_node: '●',
+            tree_node_separator: '—',
         };
         
         if let Some(path) = lua_script_path {
@@ -328,6 +334,11 @@ impl Config {
                 themes.insert(name, theme);
             }
 
+
+            let tree_node: char = globals.get::<_, String>("Tree_node").unwrap_or(defaults.tree_node.to_string()).chars().next().unwrap_or(defaults.tree_node);
+            let current_tree_node: char = globals.get::<_, String>("Current_tree_node").unwrap_or(defaults.current_tree_node.to_string()).chars().next().unwrap_or(defaults.current_tree_node);
+            let tree_node_separator: char = globals.get::<_, String>("Tree_node_separator").unwrap_or(defaults.tree_node_separator.to_string()).chars().next().unwrap_or(defaults.tree_node_separator);
+
             Ok(Config {
                 blink_cursor: globals.get("Blink_cursor").unwrap_or(defaults.blink_cursor),
                 show_fringe: globals.get("Show_fringe").unwrap_or(defaults.show_fringe),
@@ -341,6 +352,12 @@ impl Config {
                 current_theme_name: initial_theme_name,
                 indentation: globals.get("Indentation").unwrap_or(defaults.indentation),
                 electric_pair_mode: globals.get("Electric_pair_mode").unwrap_or(defaults.electric_pair_mode),
+                // tree_node: globals.get("Tree_node").unwrap_or(defaults.tree_node),
+                // current_tree_node: globals.get("Current_tree_node").unwrap_or(defaults.current_tree_node),
+                // tree_node_separator: globals.get("Tree_node_separator").unwrap_or(defaults.tree_node_separator),
+                tree_node,
+                current_tree_node,
+                tree_node_separator,
             })
         } else {
             Ok(defaults)
@@ -646,16 +663,18 @@ impl Editor {
             self.message("No more redos available.");
         }
     }
-
+    
     fn message_undo_tree(&mut self) {
         let mut display = String::new();
         for i in 0..self.states.len() {
             if i == self.current_state {
-                display.push('●');   // ■ TODO make this a configuration
+                display.push(self.config.current_tree_node);  // Use configured filled node character
             } else {
-                display.push('◯');  // □ TODO make this a configuration 
+                display.push(self.config.tree_node);  // Use configured empty node character
             }
-            display.push('—');  // TODO make this a configuration
+            if i < self.states.len() - 1 {
+                display.push(self.config.tree_node_separator);  // Use configured separator character
+            }
         }
         self.message(&display);
     }
@@ -672,6 +691,21 @@ impl Editor {
                 self.config.top_scroll_margin = globals.get("Top_scroll_margin").unwrap_or(self.config.top_scroll_margin);
                 self.config.bottom_scroll_margin = globals.get("Bottom_scroll_margin").unwrap_or(self.config.bottom_scroll_margin);
                 self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
+                self.config.indentation = globals.get("Indentation").unwrap_or(self.config.indentation);
+                self.config.electric_pair_mode = globals.get("Electric_pair_mode").unwrap_or(self.config.electric_pair_mode);
+
+                self.config.tree_node = globals.get::<_, String>("Tree_node")
+                    .map(|s| s.chars().next().unwrap_or(self.config.tree_node))
+                    .unwrap_or(self.config.tree_node);
+
+                self.config.current_tree_node = globals.get::<_, String>("Current_tree_node")
+                    .map(|s| s.chars().next().unwrap_or(self.config.current_tree_node))
+                    .unwrap_or(self.config.current_tree_node);
+
+                self.config.tree_node_separator = globals.get::<_, String>("Tree_node_separator")
+                    .map(|s| s.chars().next().unwrap_or(self.config.tree_node_separator))
+                    .unwrap_or(self.config.tree_node_separator);
+
                 // self.config.current_theme_name = globals.get("Theme").unwrap_or(self.config.current_theme_name.clone()); // TODO BUG
                 
                 

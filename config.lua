@@ -9,6 +9,9 @@ Bottom_scroll_margin = 10
 Blink_limit = 10
 Indentation = 4
 Electric_pair_mode = true
+Tree_node = "◯" -- □
+Current_tree_node = "●" -- ■
+Tree_node_separator = "—"
 
 
 function c()
