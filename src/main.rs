@@ -18,10 +18,12 @@ use chrono::{DateTime, Local};
 use std::collections::HashMap;
 
 use std::time::Duration;
+
 use std::process::Command;
 
 // TODO  color minibuffer prefix
 // TODO  fzy find in M-x 
+// TODO  wdired
 
 
 // TODO Syntax highlighting
@@ -76,6 +78,8 @@ impl Dired {
         }
         Ok(entries)
     }
+
+    
 
     fn refresh_directory_contents(&mut self) -> io::Result<()> {
         self.entries = Dired::list_directory_contents(&self.current_path)?;
@@ -173,7 +177,8 @@ impl Dired {
 
             let entry_color = if entry_name == "." || entry_name == ".." || is_dir {
                 if self.color_dired {
-                    theme.normal_cursor_color
+                    // theme.normal_cursor_color
+                    theme.dired_dir_color
                 } else {
                     theme.dired_dir_color
                 }
@@ -181,7 +186,7 @@ impl Dired {
                 theme.text_color
             };
 
-            execute!(stdout, MoveTo(3, line_number))?;
+            execute!(stdout, MoveTo(5, line_number))?;
 
             if self.color_dired {
                 execute!(
@@ -233,8 +238,8 @@ impl Dired {
                 Print(" "),
                 SetForegroundColor(theme.text_color), Print(format!("{:<3} ", owner)),
                 SetForegroundColor(if self.color_dired { theme.dired_size_color } else { theme.text_color }), Print(format!("{} ", size_str)),
-                SetForegroundColor(if self.color_dired { theme.dired_timestamp_color } else { theme.text_color }), Print(format!("{:14} ", modified.format("%b %d %H:%M"))),
-                SetForegroundColor(entry_color), Print(format!(" {}", entry_name)),
+                SetForegroundColor(if self.color_dired { theme.dired_timestamp_color } else { theme.text_color }), Print(format!("{:14}", modified.format("%b %d %H:%M"))),
+                SetForegroundColor(entry_color), Print(format!("{}", entry_name)),
                 ResetColor
             )?;
 
@@ -270,6 +275,7 @@ struct Config {
     tree_node_separator: char,
     modeline_separator_right: char,
     modeline_separator_left: char,
+    shell: String,
 }
 
 impl Config {
@@ -293,6 +299,7 @@ impl Config {
             tree_node_separator: '—',
             modeline_separator_right: '',
             modeline_separator_left: '',
+            shell: "sh".to_string(),
         };
         
         if let Some(path) = lua_script_path {
@@ -350,7 +357,9 @@ impl Config {
 
             let modeline_separator_right: char = globals.get::<_, String>("Modeline_separator_right").unwrap_or(defaults.modeline_separator_right.to_string()).chars().next().unwrap_or(defaults.modeline_separator_right);
             let modeline_separator_left: char = globals.get::<_, String>("Modeline_separator_left").unwrap_or(defaults.modeline_separator_left.to_string()).chars().next().unwrap_or(defaults.modeline_separator_left);
-
+            // let shell:String = globals.get::<_, String>("Shell").unwrap_or(defaults.shell.to_string()).chars().next().unwrap_or(defaults.shell);
+	    let shell: String = globals.get::<_, String>("Shell").unwrap_or(defaults.shell.to_string());
+	    
             Ok(Config {
                 blink_cursor: globals.get("Blink_cursor").unwrap_or(defaults.blink_cursor),
                 show_fringe: globals.get("Show_fringe").unwrap_or(defaults.show_fringe),
@@ -369,6 +378,7 @@ impl Config {
                 tree_node_separator,
                 modeline_separator_right,
                 modeline_separator_left,
+		shell,
             })
         } else {
             Ok(defaults)
@@ -1960,54 +1970,95 @@ impl Editor {
     }
 
 
-    fn draw_minibuffer(&mut self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
-        let minibuffer_bg = self.current_theme().minibuffer_color;
-        let content_fg = self.current_theme().text_color;
-        let prefix_fg = self.current_theme().dired_dir_color;
+	fn draw_minibuffer(&mut self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+	    // Retrieve current theme settings.
+	    let minibuffer_bg = self.current_theme().minibuffer_color;
+	    let content_fg = self.current_theme().text_color;
+	    let prefix_fg = self.current_theme().dired_dir_color;
 
-        // Automatically clear the message
-        if let Some(last_message_time) = self.last_message_time {
-            if last_message_time.elapsed() > Duration::from_millis(1) {
-                self.minibuffer_content.clear();
-                self.last_message_time = None;
-            }
-        }
+	    // Split the minibuffer content into lines for separate processing.
+	    let lines = self.minibuffer_content.split('\n').collect::<Vec<&str>>();
+	    let num_lines = lines.len() as u16;
 
-        let lines: Vec<&str> = self.minibuffer_content.split('\n').collect();
-        let num_lines = lines.len() as u16;
+	    // Set the minibuffer's dynamic height based on the number of lines or disable if FZY is active.
+	    if self.fzy.as_ref().map_or(true, |fzy| !fzy.active) {
+		self.minibuffer_height = std::cmp::max(num_lines, 1);
+	    }
 
-        if self.fzy.as_ref().map_or(true, |fzy| !fzy.active) {
-            self.minibuffer_height = std::cmp::max(num_lines, 1);
-        }
+	    // Calculate the starting y-coordinate for the minibuffer based on its dynamic height.
+	    let minibuffer_start_y = height - self.minibuffer_height;
 
-        let minibuffer_start_y = height - self.minibuffer_height;
+	    // Fill the background and draw each line of the minibuffer content.
+	    for (i, line) in lines.iter().enumerate() {
+		let y_position = minibuffer_start_y + i as u16;
 
-        // Fill the minibuffer background for each line
-        for y_offset in 0..self.minibuffer_height {
-            execute!(
-                stdout,
-                MoveTo(0, minibuffer_start_y + y_offset),
-                SetBackgroundColor(minibuffer_bg),
-                Print(" ".repeat(width as usize))
-            )?;
-        }
+		// Fill background for the line
+		execute!(stdout, MoveTo(0, y_position), SetBackgroundColor(minibuffer_bg), Print(" ".repeat(width as usize)))?;
 
-        // Display each line with the prefix and content
-        for (i, line) in lines.iter().enumerate() {
-            let y_position = minibuffer_start_y + i as u16;
-            execute!(
-                stdout,
-                MoveTo(0, y_position),
-                SetForegroundColor(prefix_fg),
-                Print(format!(" {}", self.minibuffer_prefix)), // Adding space to match original format
-                SetForegroundColor(content_fg),
-                Print(line)
-            )?;
-        }
+		// Display the prefix and the line content
+		execute!(
+		    stdout,
+		    MoveTo(0, y_position),
+		    SetForegroundColor(prefix_fg),
+		    Print(&format!(" {}", self.minibuffer_prefix)), // Print prefix
+		    SetForegroundColor(content_fg),
+		    Print(line) // Print the actual content line
+		)?;
+	    }
+
+	    Ok(())
+	}
+
+
+
+    // fn draw_minibuffer(&mut self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    //     let minibuffer_bg = self.current_theme().minibuffer_color;
+    //     let content_fg = self.current_theme().text_color;
+    //     let prefix_fg = self.current_theme().dired_dir_color;
+
+    //     // // Automatically clear the message
+    //     // if let Some(last_message_time) = self.last_message_time {
+    //     //     if last_message_time.elapsed() > Duration::from_millis(1) {
+    //     //         self.minibuffer_content.clear();
+    //     //         self.last_message_time = None;
+    //     //     }
+    //     // }
+
+    //     let lines: Vec<&str> = self.minibuffer_content.split('\n').collect();
+    //     let num_lines = lines.len() as u16;
+
+    //     if self.fzy.as_ref().map_or(true, |fzy| !fzy.active) {
+    //         self.minibuffer_height = std::cmp::max(num_lines, 1);
+    //     }
+
+    //     let minibuffer_start_y = height - self.minibuffer_height;
+
+    //     // Fill the minibuffer background for each line
+    //     for y_offset in 0..self.minibuffer_height {
+    //         execute!(
+    //             stdout,
+    //             MoveTo(0, minibuffer_start_y + y_offset),
+    //             SetBackgroundColor(minibuffer_bg),
+    //             Print(" ".repeat(width as usize))
+    //         )?;
+    //     }
+
+    //     // Display each line with the prefix and content
+    //     for (i, line) in lines.iter().enumerate() {
+    //         let y_position = minibuffer_start_y + i as u16;
+    //         execute!(
+    //             stdout,
+    //             MoveTo(0, y_position),
+    //             SetForegroundColor(prefix_fg),
+    //             Print(format!(" {}", self.minibuffer_prefix)), // Adding space to match original format
+    //             SetForegroundColor(content_fg),
+    //             Print(line)
+    //         )?;
+    //     }
         
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
 
 
@@ -2114,6 +2165,8 @@ impl Editor {
         }
     }
        
+
+
     fn handle_keys(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
         let mut event_handled = false;
 
@@ -2147,8 +2200,10 @@ impl Editor {
                             Ok(_) => self.message("Code executed successfully."),
                             Err(err) => self.message(&format!("Error executing code: {}", err)),
                         };
+
+
                     } else if self.minibuffer_prefix == "Shell command: " {
-                            let output = Command::new("sh") // TODO make a config
+                        let output = Command::new(&self.config.shell)
                                 .arg("-c")
                                 .arg(&minibuffer_content)
                                 .output();
@@ -2265,13 +2320,11 @@ impl Editor {
         }
 
 
-        // Assuming the mode handling functions do not return any value (unit type `()`) and you just need to call them
         if !event_handled && !self.fzy.as_ref().map_or(false, |fzy| fzy.active) && !self.minibuffer_active {
-            // Since these functions might return a Result type, we use `?` to handle any errors.
             match self.mode {
                 Mode::Normal => { self.handle_normal_mode(key)?; },
                 Mode::Insert => { self.handle_insert_mode(key)?; },
-                Mode::Dired => { self.handle_dired_mode(key)?; },
+                Mode::Dired  => { self.handle_dired_mode(key)?;  },
                 Mode::Visual => { self.handle_visual_mode(key)?; },
             }
         }
@@ -2287,6 +2340,7 @@ impl Editor {
         let shape = match self.mode {
             Mode::Normal | Mode::Dired | Mode::Visual => block,
             Mode::Insert => if self.config.insert_line_cursor { line } else { block },
+
         };
 
         print!("{}", shape);
