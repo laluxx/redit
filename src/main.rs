@@ -18,6 +18,11 @@ use chrono::{DateTime, Local};
 use std::collections::HashMap;
 
 use std::time::Duration;
+use std::process::Command;
+
+// TODO  color minibuffer prefix
+// TODO  fzy find in M-x 
+
 
 // TODO Syntax highlighting
 // extern crate tree_sitter;
@@ -244,7 +249,7 @@ impl Dired {
 
 
 
-use mlua::{Lua, Result as LuaResult};
+use mlua::{Lua, Result as LuaResult, Function};
 
 // #[derive(Debug)]
 struct Config {
@@ -263,6 +268,8 @@ struct Config {
     tree_node: char,
     current_tree_node: char,
     tree_node_separator: char,
+    modeline_separator_right: char,
+    modeline_separator_left: char,
 }
 
 impl Config {
@@ -284,6 +291,8 @@ impl Config {
             tree_node: '◯',
             current_tree_node: '●',
             tree_node_separator: '—',
+            modeline_separator_right: '',
+            modeline_separator_left: '',
         };
         
         if let Some(path) = lua_script_path {
@@ -339,6 +348,9 @@ impl Config {
             let current_tree_node: char = globals.get::<_, String>("Current_tree_node").unwrap_or(defaults.current_tree_node.to_string()).chars().next().unwrap_or(defaults.current_tree_node);
             let tree_node_separator: char = globals.get::<_, String>("Tree_node_separator").unwrap_or(defaults.tree_node_separator.to_string()).chars().next().unwrap_or(defaults.tree_node_separator);
 
+            let modeline_separator_right: char = globals.get::<_, String>("Modeline_separator_right").unwrap_or(defaults.modeline_separator_right.to_string()).chars().next().unwrap_or(defaults.modeline_separator_right);
+            let modeline_separator_left: char = globals.get::<_, String>("Modeline_separator_left").unwrap_or(defaults.modeline_separator_left.to_string()).chars().next().unwrap_or(defaults.modeline_separator_left);
+
             Ok(Config {
                 blink_cursor: globals.get("Blink_cursor").unwrap_or(defaults.blink_cursor),
                 show_fringe: globals.get("Show_fringe").unwrap_or(defaults.show_fringe),
@@ -352,12 +364,11 @@ impl Config {
                 current_theme_name: initial_theme_name,
                 indentation: globals.get("Indentation").unwrap_or(defaults.indentation),
                 electric_pair_mode: globals.get("Electric_pair_mode").unwrap_or(defaults.electric_pair_mode),
-                // tree_node: globals.get("Tree_node").unwrap_or(defaults.tree_node),
-                // current_tree_node: globals.get("Current_tree_node").unwrap_or(defaults.current_tree_node),
-                // tree_node_separator: globals.get("Tree_node_separator").unwrap_or(defaults.tree_node_separator),
                 tree_node,
                 current_tree_node,
                 tree_node_separator,
+                modeline_separator_right,
+                modeline_separator_left,
             })
         } else {
             Ok(defaults)
@@ -642,9 +653,7 @@ impl Editor {
             let state = &self.states[self.current_state];
             self.buffer = state.buffer.clone();
             self.cursor_pos = state.cursor_pos;
-            if self.current_state != 0 {
-                self.adjust_view_to_cursor("");
-            }
+            self.adjust_view_to_cursor("");
             self.message_undo_tree();
         } else {
             self.message("No more undos available.");
@@ -705,6 +714,16 @@ impl Editor {
                 self.config.tree_node_separator = globals.get::<_, String>("Tree_node_separator")
                     .map(|s| s.chars().next().unwrap_or(self.config.tree_node_separator))
                     .unwrap_or(self.config.tree_node_separator);
+
+                self.config.modeline_separator_right = globals.get::<_, String>("Modeline_separator_right")
+                    .map(|s| s.chars().next().unwrap_or(self.config.modeline_separator_right))
+                    .unwrap_or(self.config.modeline_separator_right);
+                
+                self.config.modeline_separator_left = globals.get::<_, String>("Modeline_separator_left")
+                    .map(|s| s.chars().next().unwrap_or(self.config.modeline_separator_left))
+                    .unwrap_or(self.config.modeline_separator_left);
+
+
 
                 // self.config.current_theme_name = globals.get("Theme").unwrap_or(self.config.current_theme_name.clone()); // TODO BUG
                 
@@ -1026,46 +1045,6 @@ impl Editor {
         // Move the cursor to the first non-whitespace character on the line
         self.cursor_pos.0 = required_indentation as u16;
     }
-
-    // fn indent(&mut self) {
-    //     let cursor_row = self.cursor_pos.1 as usize;
-    //     let mut brace_level = 0;
-
-    //     // Calculate the brace level up to the current line
-    //     for line in self.buffer.iter().take(cursor_row) {
-    //         brace_level += line.iter().filter(|&&c| c == '{').count();
-    //         brace_level -= line.iter().filter(|&&c| c == '}').count();
-    //         if brace_level > 0 {
-    //             brace_level = brace_level - 1; // Decrement brace level to handle line starts with '}'
-    //         }
-    //     }
-
-    //     let current_line = &self.buffer[cursor_row];
-    //     let first_non_whitespace = current_line.iter().position(|&c| !c.is_whitespace()).unwrap_or(0);
-    //     let decrease_indent = current_line.get(first_non_whitespace) == Some(&'}');
-    //     if decrease_indent {
-    //         if brace_level > 0 {
-    //             brace_level -= 1;
-    //         }
-    //     }
-
-    //     let required_indentation = brace_level * self.config.indentation;
-    //     let current_indentation = current_line.iter().take_while(|&&c| c == ' ').count();
-
-    //     // Adjust indentation
-    //     if current_indentation < required_indentation {
-    //         let additional_spaces = required_indentation - current_indentation;
-    //         let new_indent: String = std::iter::repeat(' ').take(additional_spaces).collect();
-    //         self.buffer[cursor_row].splice(..current_indentation, new_indent.chars());
-    //     } else if current_indentation > required_indentation {
-    //         self.buffer[cursor_row].drain(..current_indentation).skip(required_indentation);
-    //     }
-
-    //     // Adjust cursor position to the start of the text or after the indentation
-    //     self.cursor_pos.0 = required_indentation as u16;
-    // }
-
-
 
     fn adjust_view_to_cursor(&mut self, adjustment: &str) {
         let (_, height) = terminal::size().unwrap();
@@ -1606,28 +1585,10 @@ impl Editor {
             terminal::Clear(ClearType::All)
         )?;
 
-        self.draw_modeline(stdout, width, height)?;
+
+
         self.draw_minibuffer(stdout, width, height)?;
-
-        if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out of `self`
-            let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
-            if fzy.active {
-                fzy.draw(stdout, theme)?;
-            }
-            self.fzy.replace(fzy); // Put `fzy` back into `self`
-        }
-
-        if self.mode == Mode::Dired {
-            if let Some(mut dired) = self.dired.take() { // Temporarily take `dired` out of `self`
-                let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
-                dired.draw_dired(stdout, height, theme)?;
-                self.dired.replace(dired); // Put `dired` back into `self`
-            }
-        }
-
-        // Reset the background color for fringe and line numbers
-        execute!(stdout, SetBackgroundColor(background_color))?;
-
+        
         // Draw text area for non-Dired modes
         if self.mode != Mode::Dired {
             let mut start_col = 0;
@@ -1644,6 +1605,33 @@ impl Editor {
             self.draw_search_highlight(stdout)?;
             self.draw_selection(stdout)?;
         }
+
+        self.draw_modeline(stdout, width, height)?;
+
+
+        
+        if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out of `self`
+            let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
+            if fzy.active {
+                fzy.draw(stdout, theme)?;
+            }
+            self.fzy.replace(fzy); // Put `fzy` back into `self`
+        }
+
+
+
+        if self.mode == Mode::Dired {
+            if let Some(mut dired) = self.dired.take() { // Temporarily take `dired` out of `self`
+                let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
+                dired.draw_dired(stdout, height, theme)?;
+                self.dired.replace(dired); // Put `dired` back into `self`
+            }
+        }
+
+        // Reset the background color for fringe and line numbers
+        execute!(stdout, SetBackgroundColor(background_color))?;
+
+
         
         io::stdout().flush()?;
         Ok(())
@@ -1911,8 +1899,8 @@ impl Editor {
     }
 
     fn draw_modeline(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
-        let sep_r = "";
-        let sep_l = "";
+        let sep_r = self.config.modeline_separator_right;
+        let sep_l = self.config.modeline_separator_left;
 
         let modeline_y = height - self.minibuffer_height - 1;
 
@@ -1932,8 +1920,8 @@ impl Editor {
         let (mode_str, mode_bg_color, mode_text_color) = match self.mode {
             Mode::Normal => ("NORMAL", self.current_theme().normal_cursor_color, Color::Black),
             Mode::Insert => ("INSERT", self.current_theme().insert_cursor_color, Color::Black),
-            Mode::Dired => ("DIRED", self.current_theme().dired_mode_color, Color::Black),
-            Mode::Visual => ("VISUAL", self.current_theme().visual_mode_color, Color::Black),
+            Mode::Dired  => ("DIRED",  self.current_theme().dired_mode_color,    Color::Black),
+            Mode::Visual => ("VISUAL", self.current_theme().visual_mode_color,   Color::Black),
         };
 
         let file_bg_color = self.current_theme().modeline_lighter_color;
@@ -1958,8 +1946,9 @@ impl Editor {
 
         execute!(stdout, SetBackgroundColor(modeline_bg_color), Print(" ".repeat(fill_length_before_pos_str as usize)))?;
         execute!(stdout, SetBackgroundColor(modeline_bg_color), SetForegroundColor(self.current_theme().normal_cursor_color), Print(sep_l))?;
-        execute!(stdout, SetBackgroundColor(self.current_theme().normal_cursor_color), SetForegroundColor(Color::Black), Print(format!("{} ", pos_str)))?;
+        execute!(stdout, SetBackgroundColor(self.current_theme().normal_cursor_color), SetForegroundColor(Color::Black), Print(format!("{}", pos_str)))?;
         execute!(stdout, ResetColor)?;
+
 
         Ok(())
     }
@@ -1969,15 +1958,31 @@ impl Editor {
         self.last_message_time = Some(std::time::Instant::now());
         self.messages.push(msg.to_string());
     }
-    
+
+
     fn draw_minibuffer(&mut self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
         let minibuffer_bg = self.current_theme().minibuffer_color;
         let content_fg = self.current_theme().text_color;
-        let prefix_fg = self.current_theme().normal_cursor_color;
+        let prefix_fg = self.current_theme().dired_dir_color;
+
+        // Automatically clear the message
+        if let Some(last_message_time) = self.last_message_time {
+            if last_message_time.elapsed() > Duration::from_millis(1) {
+                self.minibuffer_content.clear();
+                self.last_message_time = None;
+            }
+        }
+
+        let lines: Vec<&str> = self.minibuffer_content.split('\n').collect();
+        let num_lines = lines.len() as u16;
+
+        if self.fzy.as_ref().map_or(true, |fzy| !fzy.active) {
+            self.minibuffer_height = std::cmp::max(num_lines, 1);
+        }
 
         let minibuffer_start_y = height - self.minibuffer_height;
 
-        // Fill the minibuffer background
+        // Fill the minibuffer background for each line
         for y_offset in 0..self.minibuffer_height {
             execute!(
                 stdout,
@@ -1987,27 +1992,68 @@ impl Editor {
             )?;
         }
 
-        // Automatically clear the message
-        if let Some(last_message_time) = self.last_message_time {
-            if last_message_time.elapsed() > Duration::from_millis(1) {
-                // Clear only the message content if the time threshold is exceeded.
-                self.minibuffer_content.clear();
-                // Reset the last message time to None to prevent repeated clearing in future draws.
-                self.last_message_time = None;
-            }
+        // Display each line with the prefix and content
+        for (i, line) in lines.iter().enumerate() {
+            let y_position = minibuffer_start_y + i as u16;
+            execute!(
+                stdout,
+                MoveTo(0, y_position),
+                SetForegroundColor(prefix_fg),
+                Print(format!(" {}", self.minibuffer_prefix)), // Adding space to match original format
+                SetForegroundColor(content_fg),
+                Print(line)
+            )?;
         }
-
-        execute!(
-            stdout,
-            MoveTo(0, minibuffer_start_y),
-            SetForegroundColor(prefix_fg),
-            Print(format!(" {}", self.minibuffer_prefix)),
-            SetForegroundColor(content_fg),
-            Print(format!("{}", self.minibuffer_content))
-        )?;
+        
 
         Ok(())
     }
+
+
+
+
+
+
+    // // ORIGINAL 
+    // fn draw_minibuffer(&mut self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
+    //     let minibuffer_bg = self.current_theme().minibuffer_color;
+    //     let content_fg = self.current_theme().text_color;
+    //     let prefix_fg = self.current_theme().normal_cursor_color;
+
+    //     let minibuffer_start_y = height - self.minibuffer_height;
+
+    //     // Fill the minibuffer background
+    //     for y_offset in 0..self.minibuffer_height {
+    //         execute!(
+    //             stdout,
+    //             MoveTo(0, minibuffer_start_y + y_offset),
+    //             SetBackgroundColor(minibuffer_bg),
+    //             Print(" ".repeat(width as usize))
+    //         )?;
+    //     }
+
+    //     // Automatically clear the message
+    //     if let Some(last_message_time) = self.last_message_time {
+    //         if last_message_time.elapsed() > Duration::from_millis(1) {
+    //             // Clear only the message content if the time threshold is exceeded.
+    //             self.minibuffer_content.clear();
+    //             // Reset the last message time to None to prevent repeated clearing in future draws.
+    //             self.last_message_time = None;
+    //         }
+    //     }
+
+    //     execute!(
+    //         stdout,
+    //         MoveTo(0, minibuffer_start_y),
+    //         SetForegroundColor(prefix_fg),
+    //         Print(format!(" {}", self.minibuffer_prefix)),
+    //         SetForegroundColor(content_fg),
+    //         Print(format!("{}", self.minibuffer_content))
+    //     )?;
+
+    //     Ok(())
+    // }
+
 
     pub fn open(&mut self, path: &PathBuf, focus: Option<&str>) -> Result<()> {
         self.current_file_path = path.clone();
@@ -2101,6 +2147,29 @@ impl Editor {
                             Ok(_) => self.message("Code executed successfully."),
                             Err(err) => self.message(&format!("Error executing code: {}", err)),
                         };
+                    } else if self.minibuffer_prefix == "Shell command: " {
+                            let output = Command::new("sh") // TODO make a config
+                                .arg("-c")
+                                .arg(&minibuffer_content)
+                                .output();
+                            
+                            match output {
+                                Ok(output) => {
+                                    let stdout = String::from_utf8_lossy(&output.stdout);
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+
+                                    if !stdout.is_empty() {
+                                        self.message(&format!("{}", stdout));
+                                    } else if !stderr.is_empty() {
+                                        self.message(&format!("Error: {}", stderr));
+                                    } else {
+                                        self.message("(Shell command succeeded with no output)");
+                                    }
+                                },
+                                Err(e) => {
+                                    self.message(&format!("Failed to execute command: {}", e));
+                                }
+                            }
                     } else if self.minibuffer_prefix == "Find file: " {
                         let file_path = PathBuf::from(&minibuffer_content);
                         self.message(&format!("Current file path: {}", file_path.display()));
@@ -2530,7 +2599,7 @@ impl Editor {
                 self.paste("before");
             },
             KeyEvent {
-                code: KeyCode::Char(':'), // Assuming ':' because Shift is held down
+                code: KeyCode::Char(':'),
                 modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
                 ..
             } => {
@@ -2538,6 +2607,17 @@ impl Editor {
                 self.minibuffer_prefix = "Eval: ".to_string();
                 self.minibuffer_content = "".to_string();
             },
+            
+            KeyEvent {
+                code: KeyCode::Char('!'),
+                modifiers: KeyModifiers::ALT,
+                ..
+            } => {
+                self.minibuffer_active = true;
+                self.minibuffer_prefix = "Shell command: ".to_string();
+                self.minibuffer_content = "".to_string();
+            },
+
 
 
             KeyEvent {

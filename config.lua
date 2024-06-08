@@ -12,7 +12,8 @@ Electric_pair_mode = true
 Tree_node = "◯" -- □
 Current_tree_node = "●" -- ■
 Tree_node_separator = "—"
-
+Modeline_separator_right = ""
+Modeline_separator_left = ""
 
 function c()
 	Normal_cursor_color = "#10B1FE"
