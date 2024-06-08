@@ -15,6 +15,7 @@ Tree_node_separator = "—"
 Modeline_separator_right = ""
 Modeline_separator_left = ""
 Shell = "zsh"
+Rainbow_mode = true
 
 function c()
    Normal_cursor_color = "#10B1FE"

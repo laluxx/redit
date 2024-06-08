@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use std::process::Command;
+use regex::Regex;
 
 // TODO  color minibuffer prefix
 // TODO  fzy find in M-x 
 // TODO  wdired
-
 
 // TODO Syntax highlighting
 // extern crate tree_sitter;
@@ -37,6 +37,33 @@ enum Mode {
     Dired,
     Visual,
 }
+
+
+fn calculate_luminance(color: &Color) -> u8 {
+    match color {
+	Color::Rgb { r, g, b } => {
+	    (0.299 * *r as f64 + 0.587 * *g as f64 + 0.114 * *b as f64).round() as u8
+	},
+	_ => 128 // Default to a mid-range luminance for non-RGB colors
+    }
+}
+
+
+fn parse_color(hex_str: &str) -> Color {
+    Color::Rgb {
+	r: u8::from_str_radix(&hex_str[1..3], 16).unwrap(),
+	g: u8::from_str_radix(&hex_str[3..5], 16).unwrap(),
+	b: u8::from_str_radix(&hex_str[5..7], 16).unwrap(),
+    }
+}
+
+
+
+
+
+
+
+
 
 struct Dired {
     current_path: PathBuf,
@@ -276,6 +303,7 @@ struct Config {
     modeline_separator_right: char,
     modeline_separator_left: char,
     shell: String,
+    rainbow_mode: bool,
 }
 
 impl Config {
@@ -300,6 +328,7 @@ impl Config {
             modeline_separator_right: '',
             modeline_separator_left: '',
             shell: "sh".to_string(),
+            rainbow_mode: true,
         };
         
         if let Some(path) = lua_script_path {
@@ -379,6 +408,8 @@ impl Config {
                 modeline_separator_right,
                 modeline_separator_left,
 		shell,
+		rainbow_mode: globals.get("Rainbow_mode").unwrap_or(defaults.rainbow_mode),
+
             })
         } else {
             Ok(defaults)
@@ -712,6 +743,7 @@ impl Editor {
                 self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
                 self.config.indentation = globals.get("Indentation").unwrap_or(self.config.indentation);
                 self.config.electric_pair_mode = globals.get("Electric_pair_mode").unwrap_or(self.config.electric_pair_mode);
+       
 
                 self.config.tree_node = globals.get::<_, String>("Tree_node")
                     .map(|s| s.chars().next().unwrap_or(self.config.tree_node))
@@ -733,7 +765,7 @@ impl Editor {
                     .map(|s| s.chars().next().unwrap_or(self.config.modeline_separator_left))
                     .unwrap_or(self.config.modeline_separator_left);
 
-
+		self.config.rainbow_mode = globals.get("Rainbow_mode").unwrap_or(self.config.rainbow_mode);
 
                 // self.config.current_theme_name = globals.get("Theme").unwrap_or(self.config.current_theme_name.clone()); // TODO BUG
                 
@@ -1647,50 +1679,146 @@ impl Editor {
         Ok(())
     }
 
-    // ORIGINAL
-    fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-        let (width, height) = terminal::size()?;
-        let text_color = self.current_theme().text_color;
-        let background_color = self.current_theme().background_color;
-        let mut start_col_base = 0;
+	fn draw_text(&self, stdout: &mut Stdout) -> io::Result<()> {
+	    let (width, height) = terminal::size()?;
+	    let default_text_color = self.current_theme().text_color;
+	    let background_color = self.current_theme().background_color;
+	    let mut start_col_base = 0;
 
-        if self.config.show_fringe {
-            start_col_base += 2;
-        }
+	    if self.config.show_fringe {
+		start_col_base += 2;
+	    }
 
-        if self.config.show_line_numbers {
-            start_col_base += 4;
-        }
+	    if self.config.show_line_numbers {
+		start_col_base += 4;
+	    }
 
-        let bottom_exclude = self.minibuffer_height + 1;
-        let effective_width = width.saturating_sub(start_col_base);
+	    let bottom_exclude = self.minibuffer_height + 1;
+	    let effective_width = width.saturating_sub(start_col_base);
 
-        for (idx, line) in self.buffer.iter().enumerate() {
-            if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-                let line_y = (idx - self.offset.1 as usize) as u16;
-                let line_content: String = line.iter().collect::<String>();
-                let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
-                    // If the line exceeds the effective width, truncate it
-                    line_content.chars().take(effective_width as usize).collect::<String>()
-                } else {
-                    line_content
-                };
+	    let hex_color_regex = Regex::new(r"#([A-Fa-f0-9]{6})").unwrap();
 
-                execute!(
-                    stdout,
-                    MoveTo(start_col_base, line_y),
-                    SetForegroundColor(text_color),
-                    SetBackgroundColor(background_color),
-                    Print(truncated_line_content)
-                )?;
-            }
-        }
+	    for (idx, line) in self.buffer.iter().enumerate() {
+		if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+		    let line_y = (idx - self.offset.1 as usize) as u16;
+		    let line_content: String = line.iter().collect::<String>();
+		    let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
+			line_content.chars().take(effective_width as usize).collect::<String>()
+		    } else {
+			line_content
+		    };
 
-        Ok(())
-    }
+		    let mut current_col = start_col_base;
+		    let mut last_match_end = 0;
+
+		    // Fill the rest of the line with spaces if needed
+		    let padded_line_content = format!("{:width$}", truncated_line_content, width = effective_width as usize);
+
+		    for cap in hex_color_regex.captures_iter(&padded_line_content) {
+			let match_str = cap.get(0).unwrap().as_str();
+			let match_start = cap.get(0).unwrap().start();
+			let match_end = cap.get(0).unwrap().end();
+
+			let before_text = &padded_line_content[last_match_end..match_start];
+			execute!(
+			    stdout,
+			    MoveTo(current_col, line_y),
+			    SetForegroundColor(default_text_color),
+			    SetBackgroundColor(background_color),
+			    Print(before_text)
+			)?;
+			current_col += before_text.len() as u16;
+
+			if self.config.rainbow_mode {
+			    // Extract RGB components and apply color only if rainbow_mode is true
+			    let hex_color = Color::Rgb {
+				r: u8::from_str_radix(&match_str[1..3], 16).unwrap_or(0),
+				g: u8::from_str_radix(&match_str[3..5], 16).unwrap_or(0),
+				b: u8::from_str_radix(&match_str[5..7], 16).unwrap_or(0),
+			    };
+			    let text_color = if calculate_luminance(&hex_color) > 128 { Color::Black } else { Color::White };
+
+			    execute!(
+				stdout,
+				MoveTo(current_col, line_y),
+				SetForegroundColor(text_color),
+				SetBackgroundColor(hex_color),
+				Print(match_str)
+			    )?;
+			} else {
+			    // Print hex code with default color if rainbow_mode is false
+			    execute!(
+				stdout,
+				MoveTo(current_col, line_y),
+				SetForegroundColor(default_text_color),
+				SetBackgroundColor(background_color),
+				Print(match_str)
+			    )?;
+			}
+			current_col += match_str.len() as u16;
+			last_match_end = match_end;
+		    }
+
+		    // Print the remaining text after the last color match
+		    let remaining_text = &padded_line_content[last_match_end..];
+		    execute!(
+			stdout,
+			MoveTo(current_col, line_y),
+			SetForegroundColor(default_text_color),
+			SetBackgroundColor(background_color),
+			Print(remaining_text)
+		    )?;
+		}
+	    }
+
+	    Ok(())
+	}
 
 
-    // // Still flicker
+    // // ORIGINAL
+    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
+    //     let (width, height) = terminal::size()?;
+    //     let text_color = self.current_theme().text_color;
+    //     let background_color = self.current_theme().background_color;
+    //     let mut start_col_base = 0;
+
+    //     if self.config.show_fringe {
+    //         start_col_base += 2;
+    //     }
+
+    //     if self.config.show_line_numbers {
+    //         start_col_base += 4;
+    //     }
+
+    //     let bottom_exclude = self.minibuffer_height + 1;
+    //     let effective_width = width.saturating_sub(start_col_base);
+
+    //     for (idx, line) in self.buffer.iter().enumerate() {
+    //         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+    //             let line_y = (idx - self.offset.1 as usize) as u16;
+    //             let line_content: String = line.iter().collect::<String>();
+    //             let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
+    //                 // If the line exceeds the effective width, truncate it
+    //                 line_content.chars().take(effective_width as usize).collect::<String>()
+    //             } else {
+    //                 line_content
+    //             };
+
+    //             execute!(
+    //                 stdout,
+    //                 MoveTo(start_col_base, line_y),
+    //                 SetForegroundColor(text_color),
+    //                 SetBackgroundColor(background_color),
+    //                 Print(truncated_line_content)
+    //             )?;
+    //         }
+    //     }
+
+    //     Ok(())
+    // }
+
+
+    // // Still flicker (syntax highlight)
     // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
     //     let (width, height) = crossterm::terminal::size()?;
     //     let text_color = self.current_theme().text_color;
