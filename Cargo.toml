@@ -10,6 +10,7 @@ build = "build.rs"
 chrono = "0.4.34"
 crossterm = "0.27.0"
 directories = "5.0.1"
+git2 = "0.18.3"
 mlua = { version = "0.7.0", features = ["lua54"] }
 notify = "6.1.1"
 regex = "1.10.4"

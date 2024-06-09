@@ -16,11 +16,22 @@ Modeline_separator_right = ""
 Modeline_separator_left = ""
 Shell = "zsh"
 Rainbow_mode = true
+Scroll_bar_mode = true
+
 
 function c()
    Normal_cursor_color = "#10B1FE"
    Insert_cursor_color = "#9F7EFE"
 end
+
+function a()
+   for i = 1, 20 do  -- This loop will iterate 20 times
+      Normal_cursor_color = "#10B1FE"
+      Normal_cursor_color = "#FFFFFF"
+      Normal_cursor_color = "#151515"
+   end
+end
+
 
 Theme = "dark" -- WAL
 -- Here you can define your hown themes
