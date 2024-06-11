@@ -23,8 +23,6 @@ Max_minibuffer_height = 30
 -- TODO message in lua
 -- TODO error in lua and rust
 
-
-
 function c()
    Normal_cursor_color = "#10B1FE"
    Insert_cursor_color = "#9F7EFE"

@@ -28,9 +28,8 @@ use regex::Regex;
 // TODO set-variable () also interactive version C-c C-x will use  the interactive
 // TODO self document variables and functions from lua and rust 
 // TODO unhardcode keybinds, make them configurable from lua and make a menu to show the actual keybinds
-// TODO per language mode and per mode keybinds
 // TODO NEXT if there is no prefix enter should insert \n in the minibuffer_content
-
+// TODO NEXT per language mode and per mode keybinds
 
 // TODO Syntax highlighting
 // extern crate tree_sitter;
@@ -589,6 +588,8 @@ impl SyntaxHighlighter {
     }
 }
 
+
+
 struct Editor {
     syntax_highlighter: SyntaxHighlighter,
     states: Vec<UndoState>, // History of states
@@ -623,6 +624,8 @@ struct Editor {
     lua: Lua,
     keychords: Keychords,
     recenter_state: usize, // 0: center, 1: top, 2: bottom
+    buffer_stack: Vec<PathBuf>,
+    current_buffer: usize,
 }
 
 impl Editor {
@@ -640,7 +643,12 @@ impl Editor {
 
         let syntax_highlighter = SyntaxHighlighter::new();
         
+        let buffer_stack = Vec::<PathBuf>::new();
+        let current_buffer = 0;
+        
         Ok(Editor {
+            buffer_stack,
+            current_buffer,
             syntax_highlighter,
             states: vec![initial_undo_state],
             current_state: 0,
@@ -737,21 +745,6 @@ impl Editor {
         } else {
             self.message("No more redos available.");
         }
-    }
-    
-    fn message_undo_tree(&mut self) {
-        let mut display = String::new();
-        for i in 0..self.states.len() {
-            if i == self.current_state {
-                display.push(self.config.current_tree_node);  // Use configured filled node character
-            } else {
-                display.push(self.config.tree_node);  // Use configured empty node character
-            }
-            if i < self.states.len() - 1 {
-                display.push(self.config.tree_node_separator);  // Use configured separator character
-            }
-        }
-        self.message(&display);
     }
 
     fn eval(&mut self, code: &str) -> std::result::Result<(), String> {
@@ -1043,6 +1036,7 @@ impl Editor {
             let current_line = self.buffer.remove(self.cursor_pos.1 as usize);
             self.buffer[self.cursor_pos.1 as usize].extend(current_line);
         }
+        self.adjust_view_to_cursor("");
     }
 
 
@@ -1476,7 +1470,6 @@ impl Editor {
             } else {
                 self.cursor_pos.0 = first_non_whitespace;
             }
-            self.adjust_view_to_cursor("center");
         }
 
         pub fn mwim_end(&mut self) {
@@ -1490,7 +1483,6 @@ impl Editor {
             } else {
                 self.cursor_pos.0 = last_non_whitespace;
             }
-            self.adjust_view_to_cursor("center");
         }
 
         
@@ -2442,13 +2434,58 @@ impl Editor {
 
 
         // TODO take a bool arg to indicate if the message should be cleared on the next keypress or not
-        // TODO error()
         // TODO preatty print keybinds
 	pub fn message(&mut self, msg: &str) {
             self.minibuffer_content = msg.to_string();
             self.last_message_time = Some(std::time::Instant::now());
             self.messages.push(msg.to_string());
 	}
+        
+        pub fn message_brute(&mut self, msg: &str) {
+            self.minibuffer_content = msg.to_string();
+            self.last_message_time = Some(std::time::Instant::now());
+            self.messages.push(msg.to_string());
+	}
+
+
+        pub fn error(&mut self, msg: &str) {
+            // ANSI escape code for red text is "\x1b[31m" and reset is "\x1b[0m"
+            let formatted_msg = format!("\x1b[31mERROR:\x1b[0m {}", msg);
+            self.minibuffer_content = formatted_msg.clone();
+            self.last_message_time = Some(std::time::Instant::now());
+            self.messages.push(formatted_msg);
+        }
+        
+        fn message_undo_tree(&mut self) {
+            let mut display = String::new();
+            for i in 0..self.states.len() {
+                if i == self.current_state {
+                    display.push(self.config.current_tree_node);  // Use configured filled node character
+                } else {
+                    display.push(self.config.tree_node);  // Use configured empty node character
+                }
+                if i < self.states.len() - 1 {
+                    display.push(self.config.tree_node_separator);  // Use configured separator character
+                }
+            }
+            self.message(&display);
+        }
+
+        fn message_buffers(&mut self) {
+            let mut display = String::new();
+            for (index, _path) in self.buffer_stack.iter().enumerate() {
+                if index == self.current_buffer {
+                    display.push('■'); // Filled square for the current buffer
+                } else {
+                    display.push('□'); // Empty square for other buffers
+                }
+                display.push('—'); // Separator
+            }
+            // Remove the trailing separator
+            display.pop();
+            self.message(&format!("{}", display));
+        }
+
 
 
         // // TODO FIXME up scrolling is wrong
@@ -2503,37 +2540,59 @@ impl Editor {
             Ok(())
         }
 
-	pub fn open(&mut self, path: &PathBuf, focus: Option<&str>) -> Result<()> {
-            self.current_file_path = path.clone();
+        // TODO After you open save the buffer ina  buffer stack
+
+        pub fn open(&mut self, path: &PathBuf, focus: Option<&str>) -> Result<()> {
+            // Check if the path is already in the buffer stack
+            if let Some(index) = self.buffer_stack.iter().position(|p| p == path) {
+                // If found, simply switch to that buffer
+                self.current_buffer = index;
+                 self.message("Switched to existing buffer.");
+            } else {
+                // If not found, add new buffer to stack and set it as the current buffer
+                self.buffer_stack.push(path.clone());
+                self.current_buffer = self.buffer_stack.len() - 1;
+                self.message("Opened new buffer.");
+            }
+
+            // Update current file path
+            self.current_file_path = path.clone();  
 
             if path.is_dir() {
-		self.dired = Some(Dired::new(path.clone(), focus)?);
-		self.mode = Mode::Dired;
+                // Handle directory opening
+                self.dired = Some(Dired::new(path.clone(), focus)?);
+                self.mode = Mode::Dired;
             } else {
-		let contents = fs::read_to_string(path)
+                // Handle file opening
+                let contents = fs::read_to_string(path)
                     .unwrap_or_else(|_| "".to_string());
-		self.buffer = contents.lines()
+                self.buffer = contents.lines()
                     .map(|line| line.chars().collect())
                     .collect();
 
-		if self.buffer.is_empty() {
+                if self.buffer.is_empty() {
                     self.buffer.push(Vec::new());
-		}
-		self.mode = Mode::Emacs; // TODO Mode global lua variable
-		self.cursor_pos = (0,0);
-		self.adjust_view_to_cursor("");
-		self.states.clear(); // Clears the undo history
-		self.snapshot(); // Creates a new initial state for undo history
-		self.current_state = 0; // Resets the current state index
+                }
 
-		self.syntax_highlighter.parse(&self.buffer);
-		let theme = self.config.themes.get(&self.config.current_theme_name).expect("Current theme not found");
-		self.syntax_highlighter.update_syntax_highlights(theme);
+                // Update editor state for the opened file
+                self.mode = Mode::Emacs; 
+                self.cursor_pos = (0,0);
+                self.adjust_view_to_cursor("");
+                self.states.clear(); // Clears the undo history
+                self.snapshot(); // Creates a new initial state for undo history
+                self.current_state = 0; 
+
+                // Syntax highlighting updates
+                self.syntax_highlighter.parse(&self.buffer);
+                let theme = self.config.themes.get(&self.config.current_theme_name)
+                    .expect("Current theme not found");
+                self.syntax_highlighter.update_syntax_highlights(theme);
+
             }
+            self.message_buffers();
 
             Ok(())
-	}
-
+        }
 
 	fn run(&mut self) -> Result<()> {
             let mut stdout = stdout();
@@ -2566,22 +2625,89 @@ impl Editor {
             }
 	}
 
-
         fn handle_global_keys(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
             match key {
 		KeyEvent {
-                    code: KeyCode::Char('f'),
-                    modifiers: KeyModifiers::CONTROL,
+                    code: KeyCode::Char(':'),
+                    modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
                     ..
 		} => {
-                    if self.keychords.ctrl_x_pressed { 
-			self.minibuffer_active = true;
-			self.minibuffer_prefix = "Find file: ".to_string();
-			self.minibuffer_content = self.current_file_path.display().to_string();
-                    } else {
-			self.config.show_fringe = !self.config.show_fringe;
-                    }
+                    self.minibuffer_active = true;
+                    self.minibuffer_prefix = "Eval: ".to_string();
+                    self.minibuffer_content = "".to_string();
 		},
+		
+                KeyEvent {
+                    code: KeyCode::Char('k'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    if self.keychords.ctrl_x_pressed {
+                        if self.buffer_stack.len() > 1 { // Ensure there's more than one buffer
+                            if self.current_buffer == 0 {
+                                // If the first buffer is currently selected, move to the next one after deletion
+                                self.buffer_stack.remove(self.current_buffer); // Remove the first buffer, which is at index 0
+                                let new_path = self.buffer_stack[self.current_buffer].clone(); // Now the new first buffer is at index 0
+                                if let Err(e) = self.open(&new_path, None) {
+                                    self.message(&format!("Failed to open next buffer: {}", e));
+                                }
+                            } else {
+                                // For any other buffer, move to the previous one after deletion
+                                let previous_buffer_index = self.current_buffer - 1;
+                                self.buffer_stack.remove(self.current_buffer);
+                                self.current_buffer = previous_buffer_index;
+                                let new_path = self.buffer_stack[self.current_buffer].clone();
+                                if let Err(e) = self.open(&new_path, None) {
+                                    self.message(&format!("Failed to open previous buffer: {}", e));
+                                }
+                            }
+                            self.message_buffers();
+                        } else {
+                            self.message("Cannot delete the only buffer.");
+                            self.error("last buffer");
+                        }
+                    }
+                },
+
+
+
+                KeyEvent {
+                    code: KeyCode::Left,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    if self.keychords.ctrl_x_pressed {
+                        if self.current_buffer > 0 {  // Ensure there is a previous buffer
+                            self.current_buffer -= 1;  // Decrement to go to the previous buffer
+                            let path_to_open = self.buffer_stack[self.current_buffer].clone();  // Clone the path to avoid borrowing issues
+                            if let Err(e) = self.open(&path_to_open, None) {
+                                self.message(&format!("Failed to open previous buffer: {}", e));
+                            }
+                        } else {
+                            self.message("No previous buffer available.");
+                        }
+                        self.message_buffers();
+                    }
+                },
+
+                KeyEvent {
+                    code: KeyCode::Right,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    if self.keychords.ctrl_x_pressed {
+                        if self.current_buffer < self.buffer_stack.len() - 1 {  // Ensure there is a next buffer
+                            self.current_buffer += 1;  // Increment to go to the next buffer
+                            let path_to_open = self.buffer_stack[self.current_buffer].clone();  // Clone the path to avoid borrowing issues
+                            if let Err(e) = self.open(&path_to_open, None) {
+                                self.message(&format!("Failed to open next buffer: {}", e));
+                            }
+                        } else {
+                            self.message("No next buffer available.");
+                        }
+                        self.message_buffers();
+                    }
+                },
 
 		KeyEvent {
                     code: KeyCode::Char('!'),
@@ -2628,9 +2754,9 @@ impl Editor {
                     ..
                 } => {
                     if self.keychords.ctrl_x_pressed {
-                        if self.minibuffer_content.is_empty() {
-                            self.message("C-x C-j → dired jump");
-                        }
+                        // if self.minibuffer_content.is_empty() {
+                        self.message("C-x C-j → dired jump");
+                        // }
                         self.dired_jump();
                         self.keychords.ctrl_x_pressed = false;
                     }
@@ -2682,7 +2808,6 @@ impl Editor {
 
             Ok(())
         }
-
 
         // TODO handle tab key for the minibuffer and do different things based on the prefix or the mode of the minibuffer in the future
 	fn handle_keys(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
@@ -3105,7 +3230,7 @@ impl Editor {
 			}
                     }
 		},
-		KeyCode::Char('h') | KeyCode::Left => {
+		KeyCode::Char('h') => {
                     if let Some(dired) = &mut self.dired {
 			let current_dir_name = dired.current_path.file_name()
                             .and_then(|name| name.to_str())
@@ -3120,7 +3245,7 @@ impl Editor {
                     }
 		},
 
-		KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+		KeyCode::Char('l') |  KeyCode::Enter => {
                     if let Some(dired) = &mut self.dired {
 			if dired.cursor_pos == 0 {
                             // Do nothing for '.'
@@ -3357,9 +3482,19 @@ impl Editor {
                     // let highlights_debug_str = format!("{:?}", self.syntax_highlighter.highlights);
                     // self.message(&highlights_debug_str);
 
-                    let cc = format!("{:?}", self.config.compile_command);
-                    self.message(&cc);
+                    // let cc = format!("{:?}", self.config.compile_command);
+                    // self.message(&cc);
 
+
+                    // Create a string with all paths from buffer_stack for display
+                    let buffer_stack_contents = self.buffer_stack.iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect::<Vec<String>>()
+                        .join(", ");
+
+                    // Display the contents of the buffer_stack using the message function
+                    self.message(&format!("Buffer Stack: [{}]", buffer_stack_contents));
+                    
 		}
 		KeyEvent {
                     code: KeyCode::Char('N'),
@@ -3439,16 +3574,6 @@ impl Editor {
 		} => {
                     self.paste("before");
 		},
-		KeyEvent {
-                    code: KeyCode::Char(':'),
-                    modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
-                    ..
-		} => {
-                    self.minibuffer_active = true;
-                    self.minibuffer_prefix = "Eval: ".to_string();
-                    self.minibuffer_content = "".to_string();
-		},
-		
 		KeyEvent {
                     code: KeyCode::Char('y'),
                     modifiers: KeyModifiers::CONTROL,
@@ -3767,6 +3892,7 @@ impl Editor {
                 } => {
                     self.right();
                 },
+
                 KeyEvent {
                     code,
                     modifiers,
@@ -3778,24 +3904,26 @@ impl Editor {
                         self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, uppercase);
                         self.cursor_pos.0 += 1;
                     },
-                    
                     (KeyCode::Char(c), KeyModifiers::NONE) => {
-                        // Handle lowercase and other characters without modifiers
-                        if self.config.electric_pair_mode && "([{'\"".contains(c) {
-                            let closing_char = match c {
-                                '(' => ')',
-                                '[' => ']',
-                                '{' => '}',
-                                '"' => '"',
-                                '\'' => '\'',
-                                _ => c,
-                            };
-                            self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
-                            self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize + 1, closing_char);
-                            self.cursor_pos.0 += 1;  // Move cursor between the pair
-                        } else {
-                            self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
-                            self.cursor_pos.0 += 1;
+                        if self.keychords.all_fields_false() {
+                            // Handle lowercase and other characters without modifiers
+                            if self.config.electric_pair_mode && "([{'\"".contains(c) {
+                                let closing_char = match c {
+                                    '(' => ')',
+                                    '[' => ']',
+                                    '{' => '}',
+                                    '"' => '"',
+                                    '\'' => '\'',
+                                    _ => c,
+                                };
+                                self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
+                                self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize + 1, closing_char);
+                                self.cursor_pos.0 += 1;  // Move cursor between the pair
+                            } else {
+                                self.buffer[self.cursor_pos.1 as usize].insert(self.cursor_pos.0 as usize, c);
+                                self.cursor_pos.0 += 1;
+                            }
+                            
                         }
                     },
 
@@ -3809,9 +3937,6 @@ impl Editor {
                     },
                     _ => {}
                 },
-
-                
-                _ => {}
             }
             Ok(())
         }
