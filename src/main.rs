@@ -48,8 +48,8 @@ enum Mode {
 
 // (for rainbow mode) TODO MOVEME
 fn calculate_luminance(color: &Color) -> u8 {
-match color {
-    Color::Rgb { r, g, b } => {
+    match color {
+        Color::Rgb { r, g, b } => {
             (0.299 * *r as f64 + 0.587 * *g as f64 + 0.114 * *b as f64).round() as u8
         },
         _ => 128 // Default to a mid-range luminance for non-RGB colors
@@ -299,6 +299,7 @@ struct Config {
     rainbow_delimiters_mode: bool,
     scroll_bar_mode: bool,
     max_minibuffer_height: u16,
+    emacs_scrolling: bool,
 }
 
 impl Config {
@@ -328,6 +329,7 @@ impl Config {
             scroll_bar_mode: true,
             max_minibuffer_height: 30,
             compile_command: "make -k".to_string(),
+            emacs_scrolling: true,
         };
         
         if let Some(path) = lua_script_path {
@@ -414,6 +416,7 @@ impl Config {
                 rainbow_delimiters_mode: globals.get("Rainbow_delimiters_mode").unwrap_or(defaults.rainbow_delimiters_mode),
                 scroll_bar_mode: globals.get("Scroll_bar_mode").unwrap_or(defaults.scroll_bar_mode),
                 max_minibuffer_height: globals.get("Max_minibuffer_height").unwrap_or(defaults.max_minibuffer_height),
+                emacs_scrolling: globals.get("Emacs_scrolling").unwrap_or(defaults.emacs_scrolling),
 
             })
         } else {
@@ -431,6 +434,7 @@ struct UndoState {
 
 struct Keychords {
     ctrl_x_pressed: bool,
+    ctrl_c_pressed: bool,
     ctrl_h_pressed: bool,
     leader_key_active: bool,
     toggle_category_active: bool,
@@ -440,6 +444,7 @@ impl Keychords {
     fn new() -> Keychords {
         Keychords {
             ctrl_x_pressed: false,
+            ctrl_c_pressed: false,
             ctrl_h_pressed: false,
             leader_key_active: false,
             toggle_category_active: false,
@@ -448,6 +453,7 @@ impl Keychords {
 
     fn reset(&mut self) {
         self.ctrl_x_pressed = false;
+        self.ctrl_c_pressed = false;
         self.ctrl_h_pressed = false;
         self.leader_key_active = false;
         self.toggle_category_active = false;
@@ -455,6 +461,7 @@ impl Keychords {
     
     fn all_fields_false(&self) -> bool {
         !self.ctrl_x_pressed
+            && !self.ctrl_c_pressed
             && !self.ctrl_h_pressed
             && !self.leader_key_active
             && !self.toggle_category_active 
@@ -761,6 +768,8 @@ impl Editor {
                 self.config.blink_limit = globals.get("Blink_limit").unwrap_or(self.config.blink_limit);
                 self.config.indentation = globals.get("Indentation").unwrap_or(self.config.indentation);
                 self.config.electric_pair_mode = globals.get("Electric_pair_mode").unwrap_or(self.config.electric_pair_mode);
+                self.config.emacs_scrolling = globals.get("Emacs_scrolling").unwrap_or(self.config.emacs_scrolling);
+
 
                 self.config.tree_node = globals.get::<_, String>("Tree_node")
                     .map(|s| s.chars().next().unwrap_or(self.config.tree_node))
@@ -1064,26 +1073,57 @@ impl Editor {
         }
     }
 
+    fn last_line(&mut self) {
+        self.cursor_pos.1 = self.buffer.len() as u16 - 1; // Move to the last line
+        let last_line_len = self.buffer.last().map_or(0, |line| line.len());
+        self.cursor_pos.0 = last_line_len as u16; // Move to the end of the last line
+        let (_, height) = size().unwrap(); // Assuming `size` returns a Result
+        let visible_lines = height - self.minibuffer_height - 1;
+        if self.buffer.len() as u16 > visible_lines {
+            self.offset.1 = self.buffer.len() as u16 - visible_lines;
+        }
+    }
+
+    fn first_line(&mut self) {
+        self.cursor_pos.0 = 0;
+        self.cursor_pos.1 = 0;
+        self.offset.0 = 0;
+        self.offset.1 = 0;
+    }
+
+
     fn up(&mut self) {
         if self.cursor_pos.1 > 0 {
             self.cursor_pos.1 -= 1;
 
-            // Adjust cursor position if it exceeds the length of the new line
+            // Adjust cursor position if it exceeds the length of the previous line
             let prev_line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
             if self.cursor_pos.0 > prev_line_len {
                 self.cursor_pos.0 = prev_line_len;
             }
 
-            // Top scroll margin
-            if self.cursor_pos.1 < self.offset.1 + self.config.top_scroll_margin && self.offset.1 > 0 {
-                self.offset.1 -= 1;
+            if self.config.emacs_scrolling {
+                // If cursor moves above the visible area, scroll half the page
+                let (_, height) = terminal::size().unwrap();
+                let text_area_height = height - self.minibuffer_height - 1;
+                let half_page = (text_area_height / 2) as u16;
+                if self.cursor_pos.1 < self.offset.1 {
+                    self.offset.1 = self.cursor_pos.1.saturating_sub(half_page);
+                    self.offset.1 = std::cmp::max(self.offset.1, 0);  // Ensure we don't scroll above the start of the buffer
+                }
+            } else {
+                // Standard scrolling behavior
+                if self.cursor_pos.1 < self.offset.1 + self.config.top_scroll_margin && self.offset.1 > 0 {
+                    self.offset.1 -= 1;
+                }
             }
         }
     }
 
+
     fn down(&mut self) {
         let (_, height) = terminal::size().unwrap();
-        let text_area_height = height - self.minibuffer_height - 1; // -1 for modeline
+        let text_area_height = height - self.minibuffer_height - 1;
 
         if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
             self.cursor_pos.1 += 1;
@@ -1094,17 +1134,26 @@ impl Editor {
                 self.cursor_pos.0 = next_line_len;
             }
 
-            let effective_text_area_height = text_area_height - self.config.bottom_scroll_margin;
-            // Adjust offset if cursor moves beyond the last line of the effective text area
-            if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
-                // Only scroll if not at the last document line
-                if self.offset.1 < self.buffer.len() as u16 - text_area_height {
-                    self.offset.1 += 1;
+            if self.config.emacs_scrolling {
+                // If cursor moves below visible area, scroll half the page
+                let half_page = (text_area_height / 2) as u16;
+                if self.cursor_pos.1 >= self.offset.1 + text_area_height {
+                    self.offset.1 = self.cursor_pos.1.saturating_sub(half_page);
+                    let max_offset = self.buffer.len() as u16 - text_area_height;
+                    self.offset.1 = std::cmp::min(self.offset.1, max_offset);
+                }
+            } else {
+                // Standard scrolling behavior
+                let effective_text_area_height = text_area_height - self.config.bottom_scroll_margin;
+                if self.cursor_pos.1 >= self.offset.1 + effective_text_area_height {
+                    if self.offset.1 < self.buffer.len() as u16 - text_area_height {
+                        self.offset.1 += 1;
+                    }
                 }
             }
         }
     }
-    
+
     fn left(&mut self) {
         if self.cursor_pos.0 > 0 {
             self.cursor_pos.0 -= 1;
@@ -1456,7 +1505,7 @@ impl Editor {
                 current_line.extend(trimmed_next_line);
             }
         }
-    }
+        }
 
 
         pub fn mwim_beginning(&mut self) {
@@ -1522,58 +1571,148 @@ impl Editor {
             self.buffer.insert(line_idx, new_line);
         }
 
-        // TODO make it behave correctly
-        // TODO NEXT transpose_chars()
-        fn transpose_words(&mut self) {
+
+        fn transpose_words(&mut self, backwards: bool) {
             if let Some(line) = self.buffer.get_mut(self.cursor_pos.1 as usize) {
                 let cursor_pos = self.cursor_pos.0 as usize; // Horizontal cursor position in characters
                 let chars: Vec<char> = line.clone();  // Clone the current line to work with
                 let line_len = chars.len();
 
-                // Locate the bounds of the word prior to the cursor
-                let mut prev_word_end = 0;
-                for i in (0..cursor_pos).rev() {
-                    if chars[i].is_whitespace() {
-                        prev_word_end = i + 1;
-                        break;
+                if backwards {
+                    // Locate the bounds of the word under the cursor
+                    let mut word_end = cursor_pos;
+                    while word_end < line_len && !chars[word_end].is_whitespace() {
+                        word_end += 1;
                     }
-                }
+                    let mut word_start = cursor_pos;
+                    while word_start > 0 && !chars[word_start - 1].is_whitespace() {
+                        word_start -= 1;
+                    }
 
-                // Locate the bounds of the word after the cursor
-                let mut next_word_start = cursor_pos;
-                while next_word_start < line_len && chars[next_word_start].is_whitespace() {
-                    next_word_start += 1;
-                }
-                let mut next_word_end = next_word_start;
-                while next_word_end < line_len && !chars[next_word_end].is_whitespace() {
-                    next_word_end += 1;
-                }
+                    // Locate the bounds of the word before the current word
+                    let mut prev_word_end = word_start;
+                    while prev_word_end > 0 && chars[prev_word_end - 1].is_whitespace() {
+                        prev_word_end -= 1;
+                    }
+                    let mut prev_word_start = prev_word_end;
+                    while prev_word_start > 0 && !chars[prev_word_start - 1].is_whitespace() {
+                        prev_word_start -= 1;
+                    }
 
-                // Ensure valid words exist to transpose
-                if next_word_start < line_len && next_word_end > next_word_start && prev_word_end < next_word_start {
-                    // Extract and transpose words
-                    let prev_word = chars[prev_word_end..cursor_pos].to_vec();
-                    let next_word = chars[next_word_start..next_word_end].to_vec();
-                    let space_between = chars[cursor_pos..next_word_start].to_vec();
+                    // Ensure valid words exist to transpose
+                    if prev_word_start < prev_word_end && word_start < word_end {
+                        // Extract and transpose words
+                        let current_word = chars[word_start..word_end].to_vec();
+                        let prev_word = chars[prev_word_start..prev_word_end].to_vec();
+                        let space_between = chars[prev_word_end..word_start].to_vec();
 
-                    // Build the new line by combining the parts
-                    let mut new_chars = Vec::new();
-                    new_chars.extend(&chars[..prev_word_end]);
-                    new_chars.extend(&next_word);
-                    new_chars.extend(&space_between);
-                    new_chars.extend(&prev_word);
-                    if next_word_end < chars.len() {
+                        // Build the new line by combining the parts
+                        let mut new_chars = Vec::new();
+                        new_chars.extend(&chars[..prev_word_start]);
+                        new_chars.extend(&current_word);
+                        new_chars.extend(&space_between);
+                        new_chars.extend(&prev_word);
+                        new_chars.extend(&chars[word_end..]);
+
+                        // Update the buffer
+                        *line = new_chars;
+                        // Recalculate cursor position
+                        self.cursor_pos.0 = (prev_word_start + current_word.len()) as u16;
+                    }
+                } else {
+                    // Locate the bounds of the word under the cursor
+                    let mut word_start = cursor_pos;
+                    while word_start > 0 && !chars[word_start - 1].is_whitespace() {
+                        word_start -= 1;
+                    }
+                    let mut word_end = cursor_pos;
+                    while word_end < line_len && !chars[word_end].is_whitespace() {
+                        word_end += 1;
+                    }
+
+                    // Locate the bounds of the word after the current word
+                    let mut next_word_start = word_end;
+                    while next_word_start < line_len && chars[next_word_start].is_whitespace() {
+                        next_word_start += 1;
+                    }
+                    let mut next_word_end = next_word_start;
+                    while next_word_end < line_len && !chars[next_word_end].is_whitespace() {
+                        next_word_end += 1;
+                    }
+
+                    // Ensure valid words exist to transpose
+                    if next_word_start < line_len && next_word_end > next_word_start && word_start < word_end {
+                        // Extract and transpose words
+                        let current_word = chars[word_start..word_end].to_vec();
+                        let next_word = chars[next_word_start..next_word_end].to_vec();
+                        let space_between = chars[word_end..next_word_start].to_vec();
+
+                        // Build the new line by combining the parts
+                        let mut new_chars = Vec::new();
+                        new_chars.extend(&chars[..word_start]);
+                        new_chars.extend(&next_word);
+                        new_chars.extend(&space_between);
+                        new_chars.extend(&current_word);
                         new_chars.extend(&chars[next_word_end..]);
-                    }
 
-                    // Update the buffer
-                    *line = new_chars;
-                    // Recalculate cursor position
-                    self.cursor_pos.0 = (prev_word_end + next_word.len() + space_between.len()) as u16;
+                        // Update the buffer
+                        *line = new_chars;
+                        // Recalculate cursor position
+                        self.cursor_pos.0 = (next_word_start + next_word.len()) as u16;
+                    }
                 }
             }
         }
 
+
+        // fn transpose_words(&mut self) {
+        //     if let Some(line) = self.buffer.get_mut(self.cursor_pos.1 as usize) {
+        //         let cursor_pos = self.cursor_pos.0 as usize; // Horizontal cursor position in characters
+        //         let chars: Vec<char> = line.clone();  // Clone the current line to work with
+        //         let line_len = chars.len();
+
+        //         // Locate the bounds of the word under the cursor
+        //         let mut word_start = cursor_pos;
+        //         while word_start > 0 && !chars[word_start - 1].is_whitespace() {
+        //             word_start -= 1;
+        //         }
+        //         let mut word_end = cursor_pos;
+        //         while word_end < line_len && !chars[word_end].is_whitespace() {
+        //             word_end += 1;
+        //         }
+
+        //         // Locate the bounds of the word after the current word
+        //         let mut next_word_start = word_end;
+        //         while next_word_start < line_len && chars[next_word_start].is_whitespace() {
+        //             next_word_start += 1;
+        //         }
+        //         let mut next_word_end = next_word_start;
+        //         while next_word_end < line_len && !chars[next_word_end].is_whitespace() {
+        //             next_word_end += 1;
+        //         }
+
+        //         // Ensure valid words exist to transpose
+        //         if next_word_start < line_len && next_word_end > next_word_start && word_start < word_end {
+        //             // Extract and transpose words
+        //             let current_word = chars[word_start..word_end].to_vec();
+        //             let next_word = chars[next_word_start..next_word_end].to_vec();
+        //             let space_between = chars[word_end..next_word_start].to_vec();
+
+        //             // Build the new line by combining the parts
+        //             let mut new_chars = Vec::new();
+        //             new_chars.extend(&chars[..word_start]);
+        //             new_chars.extend(&next_word);
+        //             new_chars.extend(&space_between);
+        //             new_chars.extend(&current_word);
+        //             new_chars.extend(&chars[next_word_end..]);
+
+        //             // Update the buffer
+        //             *line = new_chars;
+        //             // Recalculate cursor position
+        //             self.cursor_pos.0 = (next_word_start + next_word.len()) as u16;
+        //         }
+        //     }
+        // }
 
 
         fn kill_line(&mut self) {
@@ -1727,8 +1866,8 @@ impl Editor {
                     let cursor_line = (dired.cursor_pos + 2).min(height - self.minibuffer_height - 1);
                     (dired.entry_first_char_column, cursor_line)
                 })
-            // } else if self.mode == Mode::Yay {
-            //     (0, 0) // Dummy value, cursor will be hidden
+                // } else if self.mode == Mode::Yay {
+                //     (0, 0) // Dummy value, cursor will be hidden
             } else {
                 let mut start_col = 0;
                 if self.config.show_fringe {
@@ -1998,215 +2137,215 @@ impl Editor {
         // TODO rainbow_delimiters_mode
         fn draw_text(&self, stdout: &mut Stdout) -> io::Result<()> {
             let (width, height) = terminal::size()?;
-	    let default_text_color = self.current_theme().text_color;
-	    let background_color = self.current_theme().background_color;
-	    let mut start_col_base = 0;
+	        let default_text_color = self.current_theme().text_color;
+	        let background_color = self.current_theme().background_color;
+	        let mut start_col_base = 0;
 
-	    if self.config.show_fringe {
-		start_col_base += 2;
+	        if self.config.show_fringe {
+		        start_col_base += 2;
+	        }
+
+	        if self.config.show_line_numbers {
+		        start_col_base += 4;
+	        }
+
+	        let bottom_exclude = self.minibuffer_height + 1;
+	        let effective_width = width.saturating_sub(start_col_base);
+
+	        let hex_color_regex = Regex::new(r"#([A-Fa-f0-9]{6})").unwrap();
+
+	        for (idx, line) in self.buffer.iter().enumerate() {
+		        if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+		            let line_y = (idx - self.offset.1 as usize) as u16;
+		            let line_content: String = line.iter().collect::<String>();
+		            let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
+			            line_content.chars().take(effective_width as usize).collect::<String>()
+		            } else {
+			            line_content
+		            };
+
+		            let mut current_col = start_col_base;
+		            let mut last_match_end = 0;
+
+		            // Fill the rest of the line with spaces if needed
+		            let padded_line_content = format!("{:width$}", truncated_line_content, width = effective_width as usize);
+
+		            for cap in hex_color_regex.captures_iter(&padded_line_content) {
+			            let match_str = cap.get(0).unwrap().as_str();
+			            let match_start = cap.get(0).unwrap().start();
+			            let match_end = cap.get(0).unwrap().end();
+
+			            let before_text = &padded_line_content[last_match_end..match_start];
+			            execute!(
+			                stdout,
+			                MoveTo(current_col, line_y),
+			                SetForegroundColor(default_text_color),
+			                SetBackgroundColor(background_color),
+			                Print(before_text)
+			            )?;
+			            current_col += before_text.len() as u16;
+
+			            if self.config.rainbow_mode {
+			                // Extract RGB components and apply color only if rainbow_mode is true
+			                let hex_color = Color::Rgb {
+				                r: u8::from_str_radix(&match_str[1..3], 16).unwrap_or(0),
+				                g: u8::from_str_radix(&match_str[3..5], 16).unwrap_or(0),
+				                b: u8::from_str_radix(&match_str[5..7], 16).unwrap_or(0),
+			                };
+			                let text_color = if calculate_luminance(&hex_color) > 128 { self.current_theme().background_color } else { self.current_theme().text_color };
+
+			                execute!(
+				                stdout,
+				                MoveTo(current_col, line_y),
+				                SetForegroundColor(text_color),
+				                SetBackgroundColor(hex_color),
+				                Print(match_str)
+			                )?;
+			            } else {
+			                // Print hex code with default color if rainbow_mode is false
+			                execute!(
+				                stdout,
+				                MoveTo(current_col, line_y),
+				                SetForegroundColor(default_text_color),
+				                SetBackgroundColor(background_color),
+				                Print(match_str)
+			                )?;
+			            }
+			            current_col += match_str.len() as u16;
+			            last_match_end = match_end;
+		            }
+
+		            // Print the remaining text after the last color match
+		            let remaining_text = &padded_line_content[last_match_end..];
+		            execute!(
+			            stdout,
+			            MoveTo(current_col, line_y),
+			            SetForegroundColor(default_text_color),
+			            SetBackgroundColor(background_color),
+			            Print(remaining_text)
+		            )?;
+		        }
+	        }
+
+	        Ok(())
 	    }
 
-	    if self.config.show_line_numbers {
-		start_col_base += 4;
-	    }
 
-	    let bottom_exclude = self.minibuffer_height + 1;
-	    let effective_width = width.saturating_sub(start_col_base);
+	    // // ORIGINAL
+	    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
+	    //     let (width, height) = terminal::size()?;
+	    //     let text_color = self.current_theme().text_color;
+	    //     let background_color = self.current_theme().background_color;
+	    //     let mut start_col_base = 0;
 
-	    let hex_color_regex = Regex::new(r"#([A-Fa-f0-9]{6})").unwrap();
+	    //     if self.config.show_fringe {
+	    //         start_col_base += 2;
+	    //     }
 
-	    for (idx, line) in self.buffer.iter().enumerate() {
-		if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-		    let line_y = (idx - self.offset.1 as usize) as u16;
-		    let line_content: String = line.iter().collect::<String>();
-		    let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
-			line_content.chars().take(effective_width as usize).collect::<String>()
-		    } else {
-			line_content
-		    };
+	    //     if self.config.show_line_numbers {
+	    //         start_col_base += 4;
+	    //     }
 
-		    let mut current_col = start_col_base;
-		    let mut last_match_end = 0;
+	    //     let bottom_exclude = self.minibuffer_height + 1;
+	    //     let effective_width = width.saturating_sub(start_col_base);
 
-		    // Fill the rest of the line with spaces if needed
-		    let padded_line_content = format!("{:width$}", truncated_line_content, width = effective_width as usize);
+	    //     for (idx, line) in self.buffer.iter().enumerate() {
+	    //         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
+	    //             let line_y = (idx - self.offset.1 as usize) as u16;
+	    //             let line_content: String = line.iter().collect::<String>();
+	    //             let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
+	    //                 // If the line exceeds the effective width, truncate it
+	    //                 line_content.chars().take(effective_width as usize).collect::<String>()
+	    //             } else {
+	    //                 line_content
+	    //             };
 
-		    for cap in hex_color_regex.captures_iter(&padded_line_content) {
-			let match_str = cap.get(0).unwrap().as_str();
-			let match_start = cap.get(0).unwrap().start();
-			let match_end = cap.get(0).unwrap().end();
+	    //             execute!(
+	    //                 stdout,
+	    //                 MoveTo(start_col_base, line_y),
+	    //                 SetForegroundColor(text_color),
+	    //                 SetBackgroundColor(background_color),
+	    //                 Print(truncated_line_content)
+	    //             )?;
+	    //         }
+	    //     }
 
-			let before_text = &padded_line_content[last_match_end..match_start];
-			execute!(
-			    stdout,
-			    MoveTo(current_col, line_y),
-			    SetForegroundColor(default_text_color),
-			    SetBackgroundColor(background_color),
-			    Print(before_text)
-			)?;
-			current_col += before_text.len() as u16;
-
-			if self.config.rainbow_mode {
-			    // Extract RGB components and apply color only if rainbow_mode is true
-			    let hex_color = Color::Rgb {
-				r: u8::from_str_radix(&match_str[1..3], 16).unwrap_or(0),
-				g: u8::from_str_radix(&match_str[3..5], 16).unwrap_or(0),
-				b: u8::from_str_radix(&match_str[5..7], 16).unwrap_or(0),
-			    };
-			    let text_color = if calculate_luminance(&hex_color) > 128 { self.current_theme().background_color } else { self.current_theme().text_color };
-
-			    execute!(
-				stdout,
-				MoveTo(current_col, line_y),
-				SetForegroundColor(text_color),
-				SetBackgroundColor(hex_color),
-				Print(match_str)
-			    )?;
-			} else {
-			    // Print hex code with default color if rainbow_mode is false
-			    execute!(
-				stdout,
-				MoveTo(current_col, line_y),
-				SetForegroundColor(default_text_color),
-				SetBackgroundColor(background_color),
-				Print(match_str)
-			    )?;
-			}
-			current_col += match_str.len() as u16;
-			last_match_end = match_end;
-		    }
-
-		    // Print the remaining text after the last color match
-		    let remaining_text = &padded_line_content[last_match_end..];
-		    execute!(
-			stdout,
-			MoveTo(current_col, line_y),
-			SetForegroundColor(default_text_color),
-			SetBackgroundColor(background_color),
-			Print(remaining_text)
-		    )?;
-		}
-	    }
-
-	    Ok(())
-	}
+	    //     Ok(())
+	    // }
 
 
-	// // ORIGINAL
-	// fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-	//     let (width, height) = terminal::size()?;
-	//     let text_color = self.current_theme().text_color;
-	//     let background_color = self.current_theme().background_color;
-	//     let mut start_col_base = 0;
+	    // // Still flicker (syntax highlight)
+	    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
+	    //     let (width, height) = crossterm::terminal::size()?;
+	    //     let text_color = self.current_theme().text_color;
+	    //     let background_color = self.current_theme().background_color;
+	    //     let bottom_exclude = self.minibuffer_height + 1;
+	    //     let visible_lines_range = self.offset.1 as usize..(self.offset.1 + height - bottom_exclude) as usize;
 
-	//     if self.config.show_fringe {
-	//         start_col_base += 2;
-	//     }
+	    //     let mut start_col_base = 0;
+	    //     if self.config.show_fringe { start_col_base += 2; }
+	    //     if self.config.show_line_numbers { start_col_base += 4; }
 
-	//     if self.config.show_line_numbers {
-	//         start_col_base += 4;
-	//     }
+	    //     for line_idx in visible_lines_range {
+	    //         let line = match self.buffer.get(line_idx) {
+	    //             Some(line) => line,
+	    //             None => continue,
+	    //         };
+	    //         let line_y = (line_idx as u16).saturating_sub(self.offset.1);
+	    //         let line_highlights = self.syntax_highlighter.highlight_line(line_idx, &self.buffer, self.current_theme());
 
-	//     let bottom_exclude = self.minibuffer_height + 1;
-	//     let effective_width = width.saturating_sub(start_col_base);
+	    //         // Draw each character
+	    //         for (char_idx, char) in line.iter().enumerate() {
+	    //             let char_color = line_highlights.iter()
+	    //                 .find(|highlight| char_idx >= highlight.start && char_idx < highlight.end)
+	    //                 .map_or(text_color, |highlight| highlight.color);
 
-	//     for (idx, line) in self.buffer.iter().enumerate() {
-	//         if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-	//             let line_y = (idx - self.offset.1 as usize) as u16;
-	//             let line_content: String = line.iter().collect::<String>();
-	//             let truncated_line_content = if line_content.chars().count() as u16 > effective_width {
-	//                 // If the line exceeds the effective width, truncate it
-	//                 line_content.chars().take(effective_width as usize).collect::<String>()
-	//             } else {
-	//                 line_content
-	//             };
+	    //             // Calculate actual column considering the base offset and character index
+	    //             let current_col = start_col_base + char_idx as u16;
 
-	//             execute!(
-	//                 stdout,
-	//                 MoveTo(start_col_base, line_y),
-	//                 SetForegroundColor(text_color),
-	//                 SetBackgroundColor(background_color),
-	//                 Print(truncated_line_content)
-	//             )?;
-	//         }
-	//     }
+	    //             // Ensure we do not overflow the terminal width
+	    //             if current_col >= width {
+	    //                 break;
+	    //             }
 
-	//     Ok(())
-	// }
+	    //             // Draw the character with its corresponding highlight
+	    //             crossterm::execute!(
+	    //                 stdout,
+	    //                 crossterm::cursor::MoveTo(current_col, line_y),
+	    //                 crossterm::style::SetForegroundColor(char_color),
+	    //                 crossterm::style::Print(*char),
+	    //                 crossterm::style::SetBackgroundColor(background_color)
+	    //             )?;
+	    //         }
 
+	    //         // Fill the rest of the line with the background color, if needed
+	    //         if let Some(last_char_col) = line.iter().enumerate().last().map(|(idx, _)| start_col_base + idx as u16 + 1) {
+	    //             if last_char_col < width {
+	    //                 crossterm::execute!(
+	    //                     stdout,
+	    //                     crossterm::cursor::MoveTo(last_char_col, line_y),
+	    //                     crossterm::style::SetBackgroundColor(background_color),
+	    //                     crossterm::style::Print(" ".repeat((width - last_char_col) as usize))
+	    //                 )?;
+	    //             }
+	    //         }
+	    //     }
 
-	// // Still flicker (syntax highlight)
-	// fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
-	//     let (width, height) = crossterm::terminal::size()?;
-	//     let text_color = self.current_theme().text_color;
-	//     let background_color = self.current_theme().background_color;
-	//     let bottom_exclude = self.minibuffer_height + 1;
-	//     let visible_lines_range = self.offset.1 as usize..(self.offset.1 + height - bottom_exclude) as usize;
+	    //     // Reset terminal colors to defaults after drawing
+	    //     crossterm::execute!(
+	    //         stdout,
+	    //         crossterm::style::SetForegroundColor(text_color),
+	    //         crossterm::style::SetBackgroundColor(background_color),
+	    //         crossterm::style::ResetColor
+	    //     )?;
 
-	//     let mut start_col_base = 0;
-	//     if self.config.show_fringe { start_col_base += 2; }
-	//     if self.config.show_line_numbers { start_col_base += 4; }
-
-	//     for line_idx in visible_lines_range {
-	//         let line = match self.buffer.get(line_idx) {
-	//             Some(line) => line,
-	//             None => continue,
-	//         };
-	//         let line_y = (line_idx as u16).saturating_sub(self.offset.1);
-	//         let line_highlights = self.syntax_highlighter.highlight_line(line_idx, &self.buffer, self.current_theme());
-
-	//         // Draw each character
-	//         for (char_idx, char) in line.iter().enumerate() {
-	//             let char_color = line_highlights.iter()
-	//                 .find(|highlight| char_idx >= highlight.start && char_idx < highlight.end)
-	//                 .map_or(text_color, |highlight| highlight.color);
-
-	//             // Calculate actual column considering the base offset and character index
-	//             let current_col = start_col_base + char_idx as u16;
-
-	//             // Ensure we do not overflow the terminal width
-	//             if current_col >= width {
-	//                 break;
-	//             }
-
-	//             // Draw the character with its corresponding highlight
-	//             crossterm::execute!(
-	//                 stdout,
-	//                 crossterm::cursor::MoveTo(current_col, line_y),
-	//                 crossterm::style::SetForegroundColor(char_color),
-	//                 crossterm::style::Print(*char),
-	//                 crossterm::style::SetBackgroundColor(background_color)
-	//             )?;
-	//         }
-
-	//         // Fill the rest of the line with the background color, if needed
-	//         if let Some(last_char_col) = line.iter().enumerate().last().map(|(idx, _)| start_col_base + idx as u16 + 1) {
-	//             if last_char_col < width {
-	//                 crossterm::execute!(
-	//                     stdout,
-	//                     crossterm::cursor::MoveTo(last_char_col, line_y),
-	//                     crossterm::style::SetBackgroundColor(background_color),
-	//                     crossterm::style::Print(" ".repeat((width - last_char_col) as usize))
-	//                 )?;
-	//             }
-	//         }
-	//     }
-
-	//     // Reset terminal colors to defaults after drawing
-	//     crossterm::execute!(
-	//         stdout,
-	//         crossterm::style::SetForegroundColor(text_color),
-	//         crossterm::style::SetBackgroundColor(background_color),
-	//         crossterm::style::ResetColor
-	//     )?;
-
-	//     Ok(())
-	// }
+	    //     Ok(())
+	    // }
 
 
 
         
-	fn draw_search_highlight(&self, stdout: &mut io::Stdout) -> Result<()> {
+	    fn draw_search_highlight(&self, stdout: &mut io::Stdout) -> Result<()> {
             let (width, height) = size()?;
             let text_color = self.current_theme().text_color;
             let search_bg_color = self.current_theme().search_bg_color;
@@ -2214,29 +2353,29 @@ impl Editor {
             let mut start_col_base = 0;
 
             if self.config.show_fringe {
-		start_col_base += 2;
+		        start_col_base += 2;
             }
 
             if self.config.show_line_numbers {
-		start_col_base += 4;
+		        start_col_base += 4;
             }
 
             let bottom_exclude = self.minibuffer_height + 1;
             let search_string = if self.minibuffer_active {
-		&self.minibuffer_content
+		        &self.minibuffer_content
             } else {
-		&self.search_query
+		        &self.search_query
             };
 
             if self.highlight_search && !search_string.is_empty() {
-		for (idx, line) in self.buffer.iter().enumerate() {
+		        for (idx, line) in self.buffer.iter().enumerate() {
                     if idx >= self.offset.1 as usize && idx < (self.offset.1 + height - bottom_exclude) as usize {
-			let line_content: String = line.iter().collect();
-			let line_y = (idx - self.offset.1 as usize) as u16;
-			let mut current_col = start_col_base;
-			let mut last_index = 0;
+			            let line_content: String = line.iter().collect();
+			            let line_y = (idx - self.offset.1 as usize) as u16;
+			            let mut current_col = start_col_base;
+			            let mut last_index = 0;
 
-			for (start, part) in line_content.match_indices(search_string) {
+			            for (start, part) in line_content.match_indices(search_string) {
                             let preceding_text = &line_content[last_index..start];
                             execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(preceding_text))?;
                             current_col += preceding_text.len() as u16;
@@ -2245,113 +2384,113 @@ impl Editor {
                             current_col += part.len() as u16;
 
                             last_index = start + part.len();
-			}
+			            }
 
-			let trailing_text = &line_content[last_index..];
-			execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(trailing_text))?;
+			            let trailing_text = &line_content[last_index..];
+			            execute!(stdout, MoveTo(current_col, line_y), SetForegroundColor(text_color), SetBackgroundColor(background_color), Print(trailing_text))?;
                     }
-		}
+		        }
             }
 
             Ok(())
-	}
+	    }
 
-	fn draw_hl_line(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+	    fn draw_hl_line(&self, stdout: &mut io::Stdout) -> io::Result<()> {
             if self.config.show_hl_line {
-		let (width, _height) = terminal::size()?;
-		let hl_color = self.current_theme().hl_line_color;
+		        let (width, _height) = terminal::size()?;
+		        let hl_color = self.current_theme().hl_line_color;
 
-		let visible_line_index = self.cursor_pos.1 - self.offset.1;
+		        let visible_line_index = self.cursor_pos.1 - self.offset.1;
 
-		let mut start_col = 0;
+		        let mut start_col = 0;
 
-		if self.config.show_fringe {
+		        if self.config.show_fringe {
                     start_col += 2;
-		}
+		        }
 
-		if self.config.show_line_numbers {
+		        if self.config.show_line_numbers {
                     start_col += 4;
-		}
-		
-		execute!(
+		        }
+		        
+		        execute!(
                     stdout,
                     cursor::MoveTo(start_col, visible_line_index as u16),
                     SetBackgroundColor(hl_color),
                     Print(" ".repeat((width - start_col) as usize))
-		)?;
+		        )?;
 
-		// Redraw the text for the highlighted line if it's within the current view
-		if let Some(line) = self.buffer.get((self.cursor_pos.1) as usize) {
+		        // Redraw the text for the highlighted line if it's within the current view
+		        if let Some(line) = self.buffer.get((self.cursor_pos.1) as usize) {
                     let text_color = self.current_theme().text_color; // Text color
                     for (i, &ch) in line.iter().enumerate() {
-			execute!(
+			            execute!(
                             stdout,
                             cursor::MoveTo(start_col + i as u16, visible_line_index as u16),
                             SetForegroundColor(text_color),
                             Print(ch)
-			)?;
+			            )?;
                     }
-		}
+		        }
 
-		// Reset the background color after highlighting
-		execute!(
+		        // Reset the background color after highlighting
+		        execute!(
                     stdout,
                     SetBackgroundColor(self.current_theme().background_color)
-		)?;
+		        )?;
 
-		Ok(())
+		        Ok(())
             } else {
-		Ok(())
+		        Ok(())
             }
-	}
+	    }
         
-	// TODO ~ after the last line 3 options only one, none or untile the end
-	// TODO Option for relative line numbers, add one padding when we reach 4 digits lines numbers
-	fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
+	    // TODO ~ after the last line 3 options only one, none or untile the end
+	    // TODO Option for relative line numbers, add one padding when we reach 4 digits lines numbers
+	    fn draw_line_numbers(&self, stdout: &mut io::Stdout, height: u16, start_col: u16) -> Result<()> {
             if self.config.show_line_numbers {
-		let bottom_exclude = self.minibuffer_height + 1;
+		        let bottom_exclude = self.minibuffer_height + 1;
 
-		for y in 0..height - bottom_exclude {
+		        for y in 0..height - bottom_exclude {
                     let line_index = (self.offset.1 as usize) + y as usize;
                     if line_index < self.buffer.len() {
-			let absolute_line_number = line_index + 1;
-			
-			let line_number_color = if self.mode == Mode::Normal && line_index == self.cursor_pos.1 as usize {
+			            let absolute_line_number = line_index + 1;
+			            
+			            let line_number_color = if self.mode == Mode::Normal && line_index == self.cursor_pos.1 as usize {
                             self.current_theme().current_line_number_color
-			} else if self.mode == Mode::Insert && line_index == self.cursor_pos.1 as usize {
+			            } else if self.mode == Mode::Insert && line_index == self.cursor_pos.1 as usize {
                             self.current_theme().insert_cursor_color
-			} else {
+			            } else {
                             self.current_theme().line_numbers_color
-			};
+			            };
 
-			execute!(
+			            execute!(
                             stdout,
                             MoveTo(start_col, y),
                             SetForegroundColor(line_number_color),
                             Print(format!("{:>3} ", absolute_line_number))
-			)?;
+			            )?;
                     }
-		}
+		        }
             }
             Ok(())
-	}
+	    }
 
-	fn draw_fringe(&self, stdout: &mut io::Stdout, height: u16) -> Result<()> {
+	    fn draw_fringe(&self, stdout: &mut io::Stdout, height: u16) -> Result<()> {
             if self.config.show_fringe {
-		let fringe_color = self.current_theme().fringe_color;
-		let bottom_exclude = self.minibuffer_height + 1;
+		        let fringe_color = self.current_theme().fringe_color;
+		        let bottom_exclude = self.minibuffer_height + 1;
 
-		for y in 0..height - bottom_exclude { 
+		        for y in 0..height - bottom_exclude { 
                     execute!(
-			stdout,
-			MoveTo(0, y),
-			SetForegroundColor(fringe_color),
-			Print("||") // Wider fringe
+			            stdout,
+			            MoveTo(0, y),
+			            SetForegroundColor(fringe_color),
+			            Print("||") // Wider fringe
                     )?;
-		}
+		        }
             }
             Ok(())
-	}
+	    }
 
         fn draw_modeline(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
             let sep_r = self.config.modeline_separator_right;
@@ -2432,22 +2571,14 @@ impl Editor {
         }
 
 
-
         // TODO take a bool arg to indicate if the message should be cleared on the next keypress or not
         // TODO preatty print keybinds
-	pub fn message(&mut self, msg: &str) {
+	    pub fn message(&mut self, msg: &str) {
             self.minibuffer_content = msg.to_string();
             self.last_message_time = Some(std::time::Instant::now());
             self.messages.push(msg.to_string());
-	}
+	    }
         
-        pub fn message_brute(&mut self, msg: &str) {
-            self.minibuffer_content = msg.to_string();
-            self.last_message_time = Some(std::time::Instant::now());
-            self.messages.push(msg.to_string());
-	}
-
-
         pub fn error(&mut self, msg: &str) {
             // ANSI escape code for red text is "\x1b[31m" and reset is "\x1b[0m"
             let formatted_msg = format!("\x1b[31mERROR:\x1b[0m {}", msg);
@@ -2487,8 +2618,7 @@ impl Editor {
         }
 
 
-
-        // // TODO FIXME up scrolling is wrong
+        // TODO FIXME up scrolling is wrong
         fn draw_minibuffer(&mut self, stdout: &mut io::Stdout, width: u16, height: u16) -> Result<()> {
             let minibuffer_bg = self.current_theme().minibuffer_color;
             let content_fg = self.current_theme().text_color;
@@ -2547,7 +2677,7 @@ impl Editor {
             if let Some(index) = self.buffer_stack.iter().position(|p| p == path) {
                 // If found, simply switch to that buffer
                 self.current_buffer = index;
-                 self.message("Switched to existing buffer.");
+                self.message("Switched to existing buffer.");
             } else {
                 // If not found, add new buffer to stack and set it as the current buffer
                 self.buffer_stack.push(path.clone());
@@ -2594,7 +2724,7 @@ impl Editor {
             Ok(())
         }
 
-	fn run(&mut self) -> Result<()> {
+	    fn run(&mut self) -> Result<()> {
             let mut stdout = stdout();
             enable_raw_mode()?;
             execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
@@ -2602,41 +2732,41 @@ impl Editor {
             let fzy_active = self.fzy.as_ref().map_or(false, |fzy| fzy.active);
             self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
             loop {
-		self.draw_cursor(&mut stdout)?;
+		        self.draw_cursor(&mut stdout)?;
 
-		if poll(Duration::from_millis(270))? {
+		        if poll(Duration::from_millis(270))? {
                     if let Event::Key(key) = event::read()? {
-			self.force_show_cursor = true;
-			self.blink_count = 0;
-			self.handle_keys(key)?;
-			self.last_cursor_toggle = std::time::Instant::now();
-			self.draw(&mut stdout)?;
-			self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
+			            self.force_show_cursor = true;
+			            self.blink_count = 0;
+			            self.handle_keys(key)?;
+			            self.last_cursor_toggle = std::time::Instant::now();
+			            self.draw(&mut stdout)?;
+			            self.current_theme().apply_cursor_color(self.cursor_pos, &self.buffer, &self.mode, self.minibuffer_active, fzy_active);
                         
                         self.recenter_state = 0;
                         
-			if key.modifiers.is_empty() {
+			            if key.modifiers.is_empty() {
                             if !self.keychords.leader_key_active {
                                 self.keychords.reset();                                
                             }
-			}
+			            }
                     }
-		}
+		        }
             }
-	}
+	    }
 
         fn handle_global_keys(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
             match key {
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char(':'),
                     modifiers: KeyModifiers::ALT | KeyModifiers::SHIFT,
                     ..
-		} => {
+		        } => {
                     self.minibuffer_active = true;
                     self.minibuffer_prefix = "Eval: ".to_string();
                     self.minibuffer_content = "".to_string();
-		},
-		
+		        },
+		        
                 KeyEvent {
                     code: KeyCode::Char('k'),
                     modifiers: KeyModifiers::NONE,
@@ -2709,32 +2839,32 @@ impl Editor {
                     }
                 },
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('!'),
                     modifiers: KeyModifiers::ALT,
                     ..
-		} => {
+		        } => {
                     self.minibuffer_active = true;
                     self.minibuffer_prefix = "Shell command: ".to_string();
                     self.minibuffer_content = "".to_string();
-		},
+		        },
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('x'),
                     modifiers: KeyModifiers::ALT,
                     ..
-		} => {
+		        } => {
                     if let Some(fzy) = &mut self.fzy {
-			if !fzy.m_x_active {
+			            if !fzy.m_x_active {
                             fzy.m_x_active = true;
                             fzy.active = true;
                             fzy.input.clear();
                             fzy.update_items();
                             fzy.recalculate_positions();
                             self.minibuffer_height = fzy.calculate_minibuffer_height(fzy.max_visible_lines) as u16;
-			}
+			            }
                     }
-		}
+		        }
                 
                 KeyEvent {
                     code: KeyCode::Char('s'),
@@ -2791,6 +2921,9 @@ impl Editor {
                 } => {
                     if self.keychords.ctrl_x_pressed {
                         self.quit();
+                    } else {
+                        self.keychords.ctrl_c_pressed = true;
+                        self.message("C-c");
                     }
                 },
                 KeyEvent {
@@ -2810,17 +2943,17 @@ impl Editor {
         }
 
         // TODO handle tab key for the minibuffer and do different things based on the prefix or the mode of the minibuffer in the future
-	fn handle_keys(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+	    fn handle_keys(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
             let mut event_handled = false;
 
             if self.fzy.as_ref().map_or(false, |fzy| fzy.active) {
-		if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out
+		        if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out
                     event_handled = fzy.handle_input(key, self);
                     self.fzy.replace(fzy); // Put `fzy` back
                     if event_handled {
-			self.minibuffer_height = 1;
+			            self.minibuffer_height = 1;
                     }
-		}
+		        }
             }
 
 
@@ -2832,12 +2965,12 @@ impl Editor {
                         code: KeyCode::Char('g'),
                         modifiers: KeyModifiers::CONTROL,
                         ..
-		    } => {
+		            } => {
                         self.minibuffer_content.clear();
                         self.minibuffer_prefix.clear();
                         self.minibuffer_cursor_pos = (0, 0);
                         self.minibuffer_active = false;
-		    },
+		            },
 
                     KeyEvent {
                         code: KeyCode::Char('n'),
@@ -2943,8 +3076,8 @@ impl Editor {
                             self.minibuffer_cursor_pos.0 -= 1;
                         }
                     },
- 
-                   KeyEvent {
+                    
+                    KeyEvent {
                         code: KeyCode::Char('a'),
                         modifiers: KeyModifiers::CONTROL,
                         ..
@@ -2965,7 +3098,7 @@ impl Editor {
 
                     _=> {}
                 }
-	        match key.code {
+	            match key.code {
                     KeyCode::Char(c) if key.modifiers.is_empty() && self.keychords.all_fields_false() => {
                         let line_idx = self.minibuffer_cursor_pos.1 as usize;
                         let char_idx = self.minibuffer_cursor_pos.0 as usize;
@@ -3011,27 +3144,27 @@ impl Editor {
 
                     KeyCode::Esc => {
                         self.minibuffer_cursor_pos = (0, 0);
-	        	self.minibuffer_active = false;
-	        	self.minibuffer_prefix.clear();
-	        	self.minibuffer_content.clear();
-	        	self.searching = false;
-	        	self.search_query.clear();
+	        	        self.minibuffer_active = false;
+	        	        self.minibuffer_prefix.clear();
+	        	        self.minibuffer_content.clear();
+	        	        self.searching = false;
+	        	        self.search_query.clear();
                     },
 
 
                     
                     KeyCode::Enter => {
-	        	let minibuffer_content = std::mem::take(&mut self.minibuffer_content);
-	        	if self.minibuffer_prefix == "Switch theme: " {
+	        	        let minibuffer_content = std::mem::take(&mut self.minibuffer_content);
+	        	        if self.minibuffer_prefix == "Switch theme: " {
                             self.switch_theme(&minibuffer_content);
-	        	} else if self.minibuffer_prefix == "Eval: "  {
+	        	        } else if self.minibuffer_prefix == "Eval: "  {
                             match self.eval(&minibuffer_content) {
-	        		Ok(_) => self.message("Code executed successfully."),
-	        		Err(err) => self.message(&format!("Error executing code: {}", err)),
+	        		            Ok(_) => self.message("Code executed successfully."),
+	        		            Err(err) => self.message(&format!("Error executing code: {}", err)),
                             };
 
 
-	        	} else if self.minibuffer_prefix == "Shell command: " {
+	        	        } else if self.minibuffer_prefix == "Shell command: " {
                             let output = Command::new(&self.config.shell)
                                 .arg("-c")
                                 .arg(&minibuffer_content)
@@ -3054,104 +3187,104 @@ impl Editor {
                                     self.message(&format!("Failed to execute command: {}", e));
                                 }
                             }
-	        	} else if self.minibuffer_prefix == "Find file: " {
+	        	        } else if self.minibuffer_prefix == "Find file: " {
                             let file_path = PathBuf::from(&minibuffer_content);
                             self.message(&format!("Current file path: {}", file_path.display()));
 
                             if let Err(e) = self.open(&file_path, None) {
-	        		self.message(&format!("Failed to open file: {}", e));
+	        		            self.message(&format!("Failed to open file: {}", e));
                             }
 
-	        	} else if self.minibuffer_prefix == ":" {
+	        	        } else if self.minibuffer_prefix == ":" {
                             match minibuffer_content.as_str() {
-	        		"w" => {
+	        		            "w" => {
                                     match self.buffer_save() {
-	        			Ok(_) => self.message("File saved successfully."),
-	        			Err(e) => self.message(&format!("Failed to save file: {}", e)),
+	        			                Ok(_) => self.message("File saved successfully."),
+	        			                Err(e) => self.message(&format!("Failed to save file: {}", e)),
                                     }
-	        		},
-	        		"q" => {
+	        		            },
+	        		            "q" => {
                                     self.quit();
-	        		},
-	        		"wq" => {
+	        		            },
+	        		            "wq" => {
                                     self.buffer_save()?;
                                     self.quit();
-	        		},
-	        		_ => {
+	        		            },
+	        		            _ => {
                                     if let Ok(line_number) = minibuffer_content.parse::<usize>() {
-	        			self.goto_line(line_number);
+	        			                self.goto_line(line_number);
                                     } else {
-	        			self.message("Invalid command");
+	        			                self.message("Invalid command");
                                     }
-	        		}
+	        		            }
                             }
-	        	} else if self.minibuffer_prefix == "Search: " {
+	        	        } else if self.minibuffer_prefix == "Search: " {
                             self.search_query = minibuffer_content.clone();
 
                             // Find the next occurrence of the search query from the cursor's current position.
                             let mut found = false;
                             for (line_idx, line) in self.buffer.iter().enumerate().skip(self.cursor_pos.1 as usize) {
-	        		// Determine start index for search in the current line.
-	        		let start_search_idx = if line_idx == self.cursor_pos.1 as usize { self.cursor_pos.0 as usize + 1 } else { 0 };
-	        		if let Some(match_idx) = line.iter().skip(start_search_idx).collect::<String>().find(&minibuffer_content) {
+	        		            // Determine start index for search in the current line.
+	        		            let start_search_idx = if line_idx == self.cursor_pos.1 as usize { self.cursor_pos.0 as usize + 1 } else { 0 };
+	        		            if let Some(match_idx) = line.iter().skip(start_search_idx).collect::<String>().find(&minibuffer_content) {
                                     // Update cursor position to the start of the found match.
                                     self.cursor_pos = (match_idx as u16, line_idx as u16);
                                     found = true;
                                     break;
-	        		}
+	        		            }
                             }
 
                             // If no match is found after the current cursor position, optionally wrap the search to the beginning of the document.
                             if !found {
-	        		for (line_idx, line) in self.buffer.iter().enumerate().take(self.cursor_pos.1 as usize + 1) {
+	        		            for (line_idx, line) in self.buffer.iter().enumerate().take(self.cursor_pos.1 as usize + 1) {
                                     if let Some(match_idx) = line.iter().collect::<String>().find(&minibuffer_content) {
-	        			self.cursor_pos = (match_idx as u16, line_idx as u16);
-	        			break;
+	        			                self.cursor_pos = (match_idx as u16, line_idx as u16);
+	        			                break;
                                     }
-	        		}
+	        		            }
                             }
                             self.adjust_view_to_cursor("");
-	        	} else if self.mode == Mode::Dired {
+	        	        } else if self.mode == Mode::Dired {
                             if self.minibuffer_prefix == "Create directory: " {
-	        		if let Some(dired) = &mut self.dired {
+	        		            if let Some(dired) = &mut self.dired {
                                     dired.create_directory(&minibuffer_content)?;
                                     dired.refresh_directory_contents()?;
-	        		}
+	        		            }
                             } else if self.minibuffer_prefix.starts_with("Delete ") && self.minibuffer_prefix.ends_with(" [y/n]: ") {
-	        		if minibuffer_content == "y" {
+	        		            if minibuffer_content == "y" {
                                     if let Some(dired) = &mut self.dired {
-	        			dired.delete_entry()?;
+	        			                dired.delete_entry()?;
                                     }
-	        		}
+	        		            }
                             } else if self.minibuffer_prefix == "Rename: " {
-	        		if let Some(dired) = &mut self.dired {
+	        		            if let Some(dired) = &mut self.dired {
                                     dired.rename_entry(&minibuffer_content)?;
-	        		}
+	        		            }
                             } else {
-	        		let file_path = self.dired.as_ref().unwrap().current_path.join(&minibuffer_content);
-	        		if std::fs::File::create(&file_path).is_ok() {
+	        		            let file_path = self.dired.as_ref().unwrap().current_path.join(&minibuffer_content);
+	        		            if std::fs::File::create(&file_path).is_ok() {
                                     if let Some(dired) = &mut self.dired {
-	        			dired.refresh_directory_contents()?;
-	        			if self.should_open_file {
+	        			                dired.refresh_directory_contents()?;
+	        			                if self.should_open_file {
                                             self.open(&file_path, None)?;
-	        			}
+	        			                }
                                     }
-	        		}
-	        		self.should_open_file = false;
+	        		            }
+	        		            self.should_open_file = false;
                             }
-	        	}
+	        	        }
                         self.minibuffer_cursor_pos = (0, 0);
-	        	self.minibuffer_active = false;
-	        	self.minibuffer_prefix.clear();
-	        	event_handled = true;
+	        	        self.minibuffer_active = false;
+	        	        self.minibuffer_prefix.clear();
+	        	        event_handled = true;
                     },
                     _ => {}
-	        }
+	            }
             }
 
 
             if !event_handled && !self.fzy.as_ref().map_or(false, |fzy| fzy.active) && !self.minibuffer_active {
-		match self.mode {
+		        match self.mode {
                     Mode::Normal => { self.handle_normal_mode(key)?; },
                     Mode::Insert => { self.handle_insert_mode(key)?; },
                     Mode::Dired  => { self.handle_dired_mode(key)?;  },
@@ -3159,146 +3292,155 @@ impl Editor {
                     Mode::Git    => { self.handle_git_mode(key)?;    },
                     Mode::Yay    => { self.handle_yay_mode(key)?;    },
                     Mode::Emacs  => { self.handle_emacs_mode(key)?;  },
-		}
+		        }
             }
 
             self.handle_global_keys(key)?;
             
             Ok(())
-	}
+	    }
         
-	fn set_cursor_shape(&self) {
+	    fn set_cursor_shape(&self) {
             let block = "\x1b[2 q";
             let line = "\x1b[6 q";
 
             let shape = match self.mode {
-		Mode::Normal
+		        Mode::Normal
                     | Mode::Dired
                     | Mode::Visual 
                     | Mode::Git
                     | Mode::Yay
                     | Mode::Emacs
                     => block,
-		Mode::Insert => if self.config.insert_line_cursor { line } else { block },
+		        Mode::Insert => if self.config.insert_line_cursor { line } else { block },
 
             };
 
             print!("{}", shape);
             io::stdout().flush().unwrap();
-	}
+	    }
 
 
-	fn handle_git_mode(&mut self, key: KeyEvent) -> Result<()> {
+	    fn handle_git_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key.code {
-		KeyCode::Char('q') => {
+		        KeyCode::Char('q') => {
                     self.mode = Mode::Normal; // TODO to the preferred base mode instead
-		},
+		        },
 
-		_ => {}
+		        _ => {}
             }
             Ok(())
-	}
+	    }
 
-
-	fn handle_yay_mode(&mut self, key: KeyEvent) -> Result<()> {
+	    fn handle_yay_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key.code {
-		KeyCode::Char('q') => {
+		        KeyCode::Char('q') => {
                     self.mode = Mode::Normal; // TODO to the preferred base mode instead
-		},
+		        },
                 KeyCode::Char('j') | KeyCode::Down => {
-		    self.down();
+		            self.down();
                 },
-		_ => {}
+                KeyCode::Char('k') | KeyCode::Up => {
+		            self.up();
+                },
+                KeyCode::Char('l') | KeyCode::Right => {
+		            self.right();
+                },
+                KeyCode::Char('h') | KeyCode::Left => {
+		            self.left();
+                },
+
+		        _ => {}
             }
             Ok(())
-	}
+	    }
 
-	fn handle_dired_mode(&mut self, key: KeyEvent) -> Result<()> {
+	    fn handle_dired_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key.code {
-		KeyCode::Char('j') | KeyCode::Down => {
+		        KeyCode::Char('j') | KeyCode::Char('n') |KeyCode::Down => {
                     if let Some(dired) = &mut self.dired {
-			let max_index = dired.entries.len() as u16 + 1;
-			if dired.cursor_pos < max_index {
+			            let max_index = dired.entries.len() as u16 + 1;
+			            if dired.cursor_pos < max_index {
                             dired.cursor_pos += 1;
-			}
+			            }
                     }
-		},
-		KeyCode::Char('k') | KeyCode::Up => {
+		        },
+		        KeyCode::Char('k') | KeyCode::Char('p') | KeyCode::Up => {
                     if let Some(dired) = &mut self.dired {
-			if dired.cursor_pos > 0 {
+			            if dired.cursor_pos > 0 {
                             dired.cursor_pos -= 1;
-			}
+			            }
                     }
-		},
-		KeyCode::Char('h') => {
+		        },
+		        KeyCode::Char('h') | KeyCode::Char('b') | KeyCode::Left => {
                     if let Some(dired) = &mut self.dired {
-			let current_dir_name = dired.current_path.file_name()
+			            let current_dir_name = dired.current_path.file_name()
                             .and_then(|name| name.to_str())
                             .unwrap_or(""); // Get the current directory name as a &str
 
-			let parent_path = dired.current_path.parent()
+			            let parent_path = dired.current_path.parent()
                             .unwrap_or_else(|| Path::new("/"))
                             .to_path_buf();
 
-			// Update Dired with the parent path, highlighting the directory we came from
-			*dired = Dired::new(parent_path, Some(current_dir_name))?;
+			            // Update Dired with the parent path, highlighting the directory we came from
+			            *dired = Dired::new(parent_path, Some(current_dir_name))?;
                     }
-		},
+		        },
 
-		KeyCode::Char('l') |  KeyCode::Enter => {
+		        KeyCode::Char('l') | KeyCode::Char('f') | KeyCode::Right | KeyCode::Enter => {
                     if let Some(dired) = &mut self.dired {
-			if dired.cursor_pos == 0 {
+			            if dired.cursor_pos == 0 {
                             // Do nothing for '.'
-			} else if dired.cursor_pos == 1 {
+			            } else if dired.cursor_pos == 1 {
                             // Handle '..' the same as 'h', navigate to the parent directory
                             let parent_path = dired.current_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
                             *dired = Dired::new(parent_path, None)?;
-			} else {
+			            } else {
                             let selected_entry = &dired.entries[dired.cursor_pos as usize - 2]; // Adjusting for '.' and '..'
                             let path = selected_entry.path();
                             if path.is_dir() {
-				*dired = Dired::new(path.to_path_buf(), None)?;
+				                *dired = Dired::new(path.to_path_buf(), None)?;
                             } else if path.is_file() {
-				self.open(&path, None)?;
+				                self.open(&path, None)?;
                             }
-			}
+			            }
                     }
-		},
-		
-		KeyCode::Char('t') | KeyCode::Char('T') => {
+		        },
+		        
+		        KeyCode::Char('t') | KeyCode::Char('T') => {
                     self.minibuffer_active = true;
                     self.minibuffer_prefix = if matches!(key.code, KeyCode::Char('T')) {
-			"Touch and open:".to_string()
+			            "Touch and open:".to_string()
                     } else {
-			"Touch:".to_string()
+			            "Touch:".to_string()
                     };
                     self.minibuffer_content = "".to_string();
                     self.should_open_file = matches!(key.code, KeyCode::Char('T'));
-		},
+		        },
 
-		KeyCode::Char('d') => {
+		        KeyCode::Char('d') => {
                     self.minibuffer_active = true;
                     self.minibuffer_prefix = "Create directory: ".to_string();
                     self.minibuffer_content = "".to_string();
-		},
+		        },
 
-		KeyCode::Char('D') => {
+		        KeyCode::Char('D') => {
                     if let Some(dired) = &self.dired {
-			if dired.cursor_pos > 1 && (dired.cursor_pos as usize - 2) < dired.entries.len() {
+			            if dired.cursor_pos > 1 && (dired.cursor_pos as usize - 2) < dired.entries.len() {
                             let entry_to_delete = &dired.entries[dired.cursor_pos as usize - 2];
                             let entry_name = entry_to_delete.file_name().to_string_lossy().into_owned();
 
                             self.minibuffer_prefix = format!("Delete {} [y/n]: ", entry_name);
                             self.minibuffer_active = true;
                             self.minibuffer_content = "".to_string();
-			}
+			            }
                     }
-		},
+		        },
 
-		KeyCode::Char('r') => {
+		        KeyCode::Char('r') => {
                     if let Some(dired) = &self.dired {
-			// Ensure the cursor is on a valid entry (not '.' or '..')
-			if dired.cursor_pos > 1 && (dired.cursor_pos as usize - 2) < dired.entries.len() {
+			            // Ensure the cursor is on a valid entry (not '.' or '..')
+			            if dired.cursor_pos > 1 && (dired.cursor_pos as usize - 2) < dired.entries.len() {
                             let entry_to_rename = &dired.entries[dired.cursor_pos as usize - 2];
                             let entry_name = entry_to_rename.file_name().to_string_lossy().into_owned();
 
@@ -3306,20 +3448,21 @@ impl Editor {
                             self.minibuffer_active = true;
                             self.minibuffer_prefix = "Rename: ".to_string();
                             self.minibuffer_content = entry_name;
-			}
+			            }
                     }
-		},
+		        },
 
-		KeyCode::Char('q') => {
+		        KeyCode::Char('q') => {
                     self.mode = Mode::Emacs; // TODO HERE
-		},
+                    // self.message_buffers();
+		        },
 
-		_ => {}
+		        _ => {}
             }
             Ok(())
-	}
-	
-	fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
+	    }
+	    
+	    fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key {
 
                 KeyEvent {
@@ -3330,126 +3473,126 @@ impl Editor {
                     self.mode = Mode::Emacs;
                 },
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Tab,
                     modifiers: KeyModifiers::NONE,
                     ..
-		} => {
+		        } => {
                     self.indent();
-		},
+		        },
                 KeyEvent {
                     code: KeyCode::Char('l'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     if self.keychords.toggle_category_active {
                         self.config.show_line_numbers = !self.config.show_line_numbers;                        
                     } else {
                         self.recenter_top_bottom();
                     }
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char(' '),
                     modifiers: KeyModifiers::NONE,
                     ..
-		} => {
+		        } => {
                     self.keychords.leader_key_active = true;
                     self.message("SPC-"); // TODO print it only if no keys are pressed after some times
-		},
+		        },
 
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('t'),
                     modifiers: KeyModifiers::NONE,
                     ..
-		} => {
+		        } => {
                     if self.keychords.leader_key_active {
                         self.message("SPC-t-");
                         self.keychords.toggle_category_active = true;
                     }
-		},
+		        },
 
                 KeyEvent {
                     code: KeyCode::Char('r'),
                     modifiers: KeyModifiers::NONE,
                     ..
-		} => {
+		        } => {
                     if self.keychords.toggle_category_active {
                         self.config.rainbow_mode = !self.config.rainbow_mode;
                         self.message("SPC-t-r → toggle rainbow mode");
                         self.keychords.leader_key_active = false;
                     }
-		},
+		        },
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('h'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     self.keychords.ctrl_h_pressed = true;
                     self.message("C-h");
-		},
+		        },
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('c'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     self.message("C-h C-c → help commit");
                     self.mode = Mode::Git;
-		},
+		        },
 
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('s'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     if self.keychords.toggle_category_active {
                         self.config.scroll_bar_mode = !self.config.scroll_bar_mode;
                         self.message("SPC-t-s → toggle scroll bar");
                         self.keychords.leader_key_active = false;
                     }
-		},
+		        },
 
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('s'),
                     modifiers: KeyModifiers::NONE,
                     ..
-		} => {
+		        } => {
                     if self.keychords.toggle_category_active {
                         self.config.scroll_bar_mode = !self.config.scroll_bar_mode;
                         self.message("SPC-t-s → toggle scroll bar");
                         self.keychords.leader_key_active = false;
                     }
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('r'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     self.redo();
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('t'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     self.minibuffer_active = true;
                     self.minibuffer_prefix = "Switch theme: ".to_string();
                     self.minibuffer_content = "".to_string();
-		},
+		        },
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('j'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
-		    self.enter();
-		    self.snapshot();
+		        } => {
+		            self.enter();
+		            self.snapshot();
 
-		}
+		        }
                 KeyEvent {
                     code: KeyCode::Enter,
                     modifiers: KeyModifiers::NONE,
@@ -3457,19 +3600,19 @@ impl Editor {
                 } => {
                     // TODO HERE click()
                 }
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('h'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     self.backspace();
                     self.snapshot();
-		}
-		KeyEvent {
+		        }
+		        KeyEvent {
                     code: KeyCode::Char('p'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     // // Check if there's an existing search query and display it as a message
                     // if !self.search_query.is_empty() {
                     //     self.message(&format!("Search query: {}", self.search_query));
@@ -3495,192 +3638,183 @@ impl Editor {
                     // Display the contents of the buffer_stack using the message function
                     self.message(&format!("Buffer Stack: [{}]", buffer_stack_contents));
                     
-		}
-		KeyEvent {
+		        }
+                
+		        KeyEvent {
                     code: KeyCode::Char('N'),
                     modifiers: KeyModifiers::SHIFT,
                     ..
-		} => {
+		        } => {
                     self.highlight_search = true;
                     self.search_previous();
-		}
-		KeyEvent {
+		        }
+		        KeyEvent {
                     code: KeyCode::Char('G'),
                     modifiers: KeyModifiers::SHIFT,
                     ..
-		} => {
-                    self.cursor_pos.1 = self.buffer.len() as u16 - 1; // Move to the last line
-                    let last_line_len = self.buffer.last().map_or(0, |line| line.len());
-                    self.cursor_pos.0 = last_line_len as u16; // Move to the end of the last line
-                    let (_, height) = size()?;
-                    let visible_lines = height - self.minibuffer_height - 1;
-                    if self.buffer.len() as u16 > visible_lines {
-			self.offset.1 = self.buffer.len() as u16 - visible_lines;
-                    }
-		},
-		KeyEvent {
+		        } => {
+                    self.last_line();
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('O'),
                     modifiers: KeyModifiers::SHIFT,
                     ..
-		} => {
+		        } => {
                     self.snapshot();
                     self.open_above();
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('k'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     // TODO Undo BUG
                     self.kill_line();
                     self.snapshot();
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('J'),
                     modifiers: KeyModifiers::SHIFT,
                     ..
-		} => {
+		        } => {
                     self.join();
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('A'),
                     modifiers: KeyModifiers::SHIFT,
                     ..
-		} => {
+		        } => {
                     self.cursor_pos.0 = self.buffer[self.cursor_pos.1 as usize].len() as u16;
                     self.mode = Mode::Insert;
                     self.set_cursor_shape();
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('I'),
                     modifiers: KeyModifiers::SHIFT,
                     ..
-		} => {
+		        } => {
                     self.back_to_indentation();
                     self.mode = Mode::Insert;
                     self.set_cursor_shape();
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('m'),
                     modifiers: KeyModifiers::ALT,
                     ..
-		} => {
+		        } => {
                     self.back_to_indentation();
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('P'),
                     modifiers: KeyModifiers::SHIFT,
                     ..
-		} => {
+		        } => {
                     self.paste("before");
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('y'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     self.mode = Mode::Yay;
-		},
+		        },
 
 
-		KeyEvent {
+		        KeyEvent {
                     code,
                     modifiers: KeyModifiers::NONE,
                     ..
-		} => match code {
+		        } => match code {
                     KeyCode::Backspace => {
-			self.backspace();
-			self.snapshot();
+			            self.backspace();
+			            self.snapshot();
                     },
                     KeyCode::Char('f') => {
-			if let Some(fzy) = &mut self.fzy {
+			            if let Some(fzy) = &mut self.fzy {
                             // fzy.current_path = self.current_file_path.parent().unwrap().to_path_buf(); // TODO
                             fzy.active = true;
                             fzy.input.clear();
                             fzy.update_items();
                             fzy.recalculate_positions();
                             self.minibuffer_height = fzy.calculate_minibuffer_height(fzy.max_visible_lines) as u16;
-			}
+			            }
 
                     },
                     KeyCode::Char('/') => {
-			self.searching = true;
-			self.highlight_search = true;
-			self.minibuffer_active = true;
+			            self.searching = true;
+			            self.highlight_search = true;
+			            self.minibuffer_active = true;
                         self.minibuffer_content.clear();
-			self.minibuffer_prefix = "Search: ".to_string();
+			            self.minibuffer_prefix = "Search: ".to_string();
                     },
                     KeyCode::Char('n') => {
-			self.highlight_search = true;
-			self.search_next();
+			            self.highlight_search = true;
+			            self.search_next();
                     },
                     KeyCode::Esc => {
-			self.highlight_search = false;
+			            self.highlight_search = false;
                     },
                     KeyCode::Char('e') => {
-			self.eval_line();
+			            self.eval_line();
                     },
                     KeyCode::Char('0') => {
-			self.cursor_pos.0 = 0;
+			            self.cursor_pos.0 = 0;
                     },
                     KeyCode::Char('x') => {
-			self.delete_char();
-			self.snapshot();
+			            self.delete_char();
+			            self.snapshot();
                     },
                     KeyCode::Char('y') => {
-			if let Some(line) = self.buffer.get(self.cursor_pos.1 as usize) {
+			            if let Some(line) = self.buffer.get(self.cursor_pos.1 as usize) {
                             let line_text = line.iter().collect::<String>();
                             self.clipboard = line_text;
                             self.copied_line = true;
                             self.message("Line copied to clipboard.");
-			}
+			            }
                     },
                     KeyCode::Char('p') => {
-			self.paste("after");
+			            self.paste("after");
                     },
                     KeyCode::Char('o') => {
-			self.snapshot();
-			self.open_below();
+			            self.snapshot();
+			            self.open_below();
                     },
                     KeyCode::Char('a') => {
-			self.right();
-			self.mode = Mode::Insert;
-			self.set_cursor_shape();
+			            self.right();
+			            self.mode = Mode::Insert;
+			            self.set_cursor_shape();
                     },
                     KeyCode::Char('v') => {
-			// TODO clamp the cursor position
-			self.mode = Mode::Visual;
-			self.selection_start = Some(self.cursor_pos);
-			self.selection_end = Some(self.cursor_pos);
+			            // TODO clamp the cursor position
+			            self.mode = Mode::Visual;
+			            self.selection_start = Some(self.cursor_pos);
+			            self.selection_end = Some(self.cursor_pos);
                     },
                     KeyCode::Char('g') => {
-			self.cursor_pos.0 = 0;
-			self.cursor_pos.1 = 0;
-			self.offset.0 = 0;
-			self.offset.1 = 0;
+                        self.first_line();
                     },
                     KeyCode::Char('i') => {
-			self.mode = Mode::Insert;
-			self.set_cursor_shape();
-			self.snapshot();
-			// self.message("--INSERT--"); 
+			            self.mode = Mode::Insert;
+			            self.set_cursor_shape();
+			            self.snapshot();
+			            // self.message("--INSERT--"); 
                     },
                     KeyCode::Char('d') => {
-			self.dired_jump();
+			            self.dired_jump();
                     },
                     KeyCode::Char(':') => {
-			self.minibuffer_active = true;
-			self.minibuffer_prefix = ":".to_string();
-			self.minibuffer_content = "".to_string();
+			            self.minibuffer_active = true;
+			            self.minibuffer_prefix = ":".to_string();
+			            self.minibuffer_content = "".to_string();
                     },
                     KeyCode::Char('j') | KeyCode::Down => {
-			self.down();
+			            self.down();
                     },
                     KeyCode::Char('k') | KeyCode::Up => {
-			self.up();
+			            self.up();
                     },
                     KeyCode::Char('h') | KeyCode::Left => {
-			self.left();
+			            self.left();
                     },
                     KeyCode::Char('l') | KeyCode::Right => {
                         if self.keychords.toggle_category_active {
@@ -3688,108 +3822,187 @@ impl Editor {
                             self.message("SPC-t-l → toggle line numbers");
                             self.keychords.leader_key_active = false;
                         } else {
-			    self.right();
+			                self.right();
                         }
                     },
                     KeyCode::Char('u') => {
-			self.undo();
+			            self.undo();
                     },
                     KeyCode::Char('q') => {
-			self.quit();
+			            self.quit();
                     },
                     _ => {}
-		},
-		_ => {}
+		        },
+		        _ => {}
             }
 
             Ok(())
-	}
+	    }
 
-	fn handle_visual_mode(&mut self, key: KeyEvent) -> Result<()> {
+	    fn handle_visual_mode(&mut self, key: KeyEvent) -> Result<()> {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Char('n'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
+			            self.cursor_pos.1 += 1;
+			            // Adjust for potentially shorter next line
+			            self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
+                    }
+                },
+                KeyEvent {
+                    code: KeyCode::Char('p'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    if self.cursor_pos.1 > 0 {
+			            self.cursor_pos.1 -= 1;
+			            // Adjust for potentially shorter previous line
+			            self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
+                    }
+                },
+                KeyEvent {
+                    code: KeyCode::Char('b'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    if self.cursor_pos.0 > 0 {
+			            self.cursor_pos.0 -= 1;
+                    }
+                },
+                KeyEvent {
+                    code: KeyCode::Char('f'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    // Prevent moving into the newline character at the end of lines
+                    let line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
+                    if self.cursor_pos.0 < line_len.saturating_sub(1) {
+			            self.cursor_pos.0 += 1;
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char(' '),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.mode = Mode::Emacs;
+                    self.set_cursor_shape();
+                    self.selection_start = None;
+                    self.selection_end = None;
+                }
+
+                _=> {}
+            }
+            
             match key.code {
-		KeyCode::Esc => {
+		        KeyCode::Esc => {
                     self.mode = Mode::Normal;
                     self.set_cursor_shape();
                     self.selection_start = None;
                     self.selection_end = None;
-		},
-		KeyCode::Char('v') => {
+		        },
+		        KeyCode::Char('v') => {
                     self.mode = Mode::Normal;
                     self.selection_start = None;
                     self.selection_end = None;
-		},
-		KeyCode::Char('e') => {
+		        },
+		        KeyCode::Char('e') => {
                     match self.eval_region() {
-			Ok(_) => {}, // Handle success case, if necessary
-			Err(err_msg) => self.message(&err_msg),
+			            Ok(_) => {}, // Handle success case, if necessary
+			            Err(err_msg) => self.message(&err_msg),
                     }
-		},
-		KeyCode::Char('x') => {
+		        },
+		        KeyCode::Char('x') => {
                     self.delete_selection();
                     self.mode = Mode::Normal;
                     self.selection_start = None;
                     self.selection_end = None;
-		},
-		KeyCode::Char('h') | KeyCode::Left => {
+		        },
+		        KeyCode::Char('h') | KeyCode::Left => {
                     if self.cursor_pos.0 > 0 {
-			self.cursor_pos.0 -= 1;
+			            self.cursor_pos.0 -= 1;
                     }
-		},
-		KeyCode::Char('l') | KeyCode::Right => {
+		        },
+		        KeyCode::Char('l') | KeyCode::Right => {
                     // Prevent moving into the newline character at the end of lines
                     let line_len = self.buffer[self.cursor_pos.1 as usize].len() as u16;
                     if self.cursor_pos.0 < line_len.saturating_sub(1) {
-			self.cursor_pos.0 += 1;
+			            self.cursor_pos.0 += 1;
                     }
-		},
-		KeyCode::Char('j') | KeyCode::Down => {
+		        },
+		        KeyCode::Char('j') | KeyCode::Down => {
                     if self.cursor_pos.1 < self.buffer.len() as u16 - 1 {
-			self.cursor_pos.1 += 1;
-			// Adjust for potentially shorter next line
-			self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
+			            self.cursor_pos.1 += 1;
+			            // Adjust for potentially shorter next line
+			            self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
                     }
-		},
-		KeyCode::Char('k') | KeyCode::Up => {
+		        },
+		        KeyCode::Char('k') | KeyCode::Up => {
                     if self.cursor_pos.1 > 0 {
-			self.cursor_pos.1 -= 1;
-			// Adjust for potentially shorter previous line
-			self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
+			            self.cursor_pos.1 -= 1;
+			            // Adjust for potentially shorter previous line
+			            self.cursor_pos.0 = self.cursor_pos.0.min(self.buffer[self.cursor_pos.1 as usize].len() as u16);
                     }
-		},
+		        },
 
-		KeyCode::Char('y') => {
+
+		        KeyCode::Char('y') => {
                     // TODO Reset cursor to the original position
                     self.copy_selection();
                     self.mode = Mode::Normal;
                     self.selection_start = None;
                     self.selection_end = None;
-		},
-		_ => {}
+		        },
+		        _ => {}
             };
 
             // Update the selection end after movement, ensuring it's within valid text regions
             self.selection_end = Some(self.cursor_pos);
 
             Ok(())
-	}
+	    }
 
         fn handle_emacs_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key {
+
+                KeyEvent {
+                    code: KeyCode::Char('/'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    self.undo();
+                },
+
+
                 KeyEvent {
                     code: KeyCode::Char('t'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 } => {
-                    self.transpose_words();
+                    self.transpose_words(false);
                 },
+
+                
                 KeyEvent {
-                    code: KeyCode::Char('d'),
+                    code: KeyCode::Char('t'),
+                    modifiers: KeyModifiers::ALT,
+                    ..
+                } => {
+                    self.transpose_words(true);
+                },
+
+                
+                KeyEvent {
+                    code: KeyCode::Char(' '),
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 } => {
-		    self.delete_char();
-		    self.snapshot();
-
+                    self.mode = Mode::Visual;
+		            self.selection_start = Some(self.cursor_pos);
+		            self.selection_end = Some(self.cursor_pos);
                 },
                 KeyEvent {
                     code: KeyCode::Char('k'),
@@ -3872,11 +4085,29 @@ impl Editor {
                     self.down();
                 },
                 KeyEvent {
+                    code: KeyCode::Char('n'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    if self.keychords.ctrl_c_pressed {
+                        self.last_line();
+                    }
+                },
+                KeyEvent {
                     code: KeyCode::Char('p'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 } => {
                     self.up();
+                },
+                KeyEvent {
+                    code: KeyCode::Char('p'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    if self.keychords.ctrl_c_pressed {
+                        self.first_line();
+                    }
                 },
                 KeyEvent {
                     code: KeyCode::Char('b'),
@@ -3940,8 +4171,6 @@ impl Editor {
             }
             Ok(())
         }
-
-
 
         fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key {
@@ -4085,126 +4314,126 @@ impl Editor {
 
 
     struct Theme {
-	background_color: Color,
-	text_color: Color,
-	normal_cursor_color: Color,
-	insert_cursor_color: Color,
-	fringe_color: Color,
-	line_numbers_color: Color,
-	current_line_number_color: Color,
-	modeline_color: Color,
-	modeline_lighter_color: Color,
-	minibuffer_color: Color,
-	dired_mode_color: Color,
-	dired_timestamp_color: Color,
-	dired_path_color: Color,
-	dired_size_color: Color,
-	dired_dir_color: Color,
-	comment_color: Color,
-	warning_color: Color,
-	error_color: Color,
-	ok_color: Color,
-	search_bg_color: Color,
-	visual_mode_color: Color,
-	selection_color: Color,
-	hl_line_color: Color,
-	// Syntax highlight colors
-	use_color: Color,
-	string_color: Color,
+	    background_color: Color,
+	    text_color: Color,
+	    normal_cursor_color: Color,
+	    insert_cursor_color: Color,
+	    fringe_color: Color,
+	    line_numbers_color: Color,
+	    current_line_number_color: Color,
+	    modeline_color: Color,
+	    modeline_lighter_color: Color,
+	    minibuffer_color: Color,
+	    dired_mode_color: Color,
+	    dired_timestamp_color: Color,
+	    dired_path_color: Color,
+	    dired_size_color: Color,
+	    dired_dir_color: Color,
+	    comment_color: Color,
+	    warning_color: Color,
+	    error_color: Color,
+	    ok_color: Color,
+	    search_bg_color: Color,
+	    visual_mode_color: Color,
+	    selection_color: Color,
+	    hl_line_color: Color,
+	    // Syntax highlight colors
+	    use_color: Color,
+	    string_color: Color,
     }
 
     impl Theme {
 
-	fn wal() -> Self {
+	    fn wal() -> Self {
             match load_wal_colors() {
-		Ok(colors) if !colors.is_empty() => {
+		        Ok(colors) if !colors.is_empty() => {
                     Theme::from_wal_colors(colors)
-		},
-		_ => Theme::fallback()
+		        },
+		        _ => Theme::fallback()
             }
-	}
+	    }
 
-	fn from_wal_colors(colors: Vec<Color>) -> Self {
+	    fn from_wal_colors(colors: Vec<Color>) -> Self {
             Theme {
-		background_color: colors.get(0).cloned().unwrap(),
-		text_color: colors.get(7).cloned().unwrap(),
-		normal_cursor_color: colors.get(12).cloned().unwrap(),
-		insert_cursor_color: colors.get(13).cloned().unwrap(),
-		fringe_color: colors.get(4).cloned().unwrap(),
-		line_numbers_color: colors.get(8).cloned().unwrap(),
-		current_line_number_color: colors.get(5).cloned().unwrap(),
-		modeline_color: colors.get(6).cloned().unwrap(),
-		modeline_lighter_color: colors.get(8).cloned().unwrap(),
-		minibuffer_color: colors.get(0).cloned().unwrap(),
-		dired_mode_color: colors.get(12).cloned().unwrap(),
-		dired_timestamp_color: colors.get(11).cloned().unwrap(),
-		dired_path_color: colors.get(12).cloned().unwrap(),
-		dired_size_color: colors.get(14).cloned().unwrap(),
-		dired_dir_color: colors.get(12).cloned().unwrap(),
-		comment_color: colors.get(8).cloned().unwrap(),
-		warning_color: colors.get(11).cloned().unwrap(),
-		error_color: colors.get(9).cloned().unwrap(),
-		ok_color: colors.get(2).cloned().unwrap(),
-		search_bg_color: colors.get(8).cloned().unwrap(),
-		visual_mode_color: colors.get(5).cloned().unwrap(),
-		selection_color: colors.get(5).cloned().unwrap(),
-		hl_line_color: colors.get(8).cloned().unwrap(),
-		use_color: colors.get(12).cloned().unwrap(),
-		string_color: colors.get(10).cloned().unwrap(),
+		        background_color: colors.get(0).cloned().unwrap(),
+		        text_color: colors.get(7).cloned().unwrap(),
+		        normal_cursor_color: colors.get(12).cloned().unwrap(),
+		        insert_cursor_color: colors.get(13).cloned().unwrap(),
+		        fringe_color: colors.get(4).cloned().unwrap(),
+		        line_numbers_color: colors.get(8).cloned().unwrap(),
+		        current_line_number_color: colors.get(5).cloned().unwrap(),
+		        modeline_color: colors.get(6).cloned().unwrap(),
+		        modeline_lighter_color: colors.get(8).cloned().unwrap(),
+		        minibuffer_color: colors.get(0).cloned().unwrap(),
+		        dired_mode_color: colors.get(12).cloned().unwrap(),
+		        dired_timestamp_color: colors.get(11).cloned().unwrap(),
+		        dired_path_color: colors.get(12).cloned().unwrap(),
+		        dired_size_color: colors.get(14).cloned().unwrap(),
+		        dired_dir_color: colors.get(12).cloned().unwrap(),
+		        comment_color: colors.get(8).cloned().unwrap(),
+		        warning_color: colors.get(11).cloned().unwrap(),
+		        error_color: colors.get(9).cloned().unwrap(),
+		        ok_color: colors.get(2).cloned().unwrap(),
+		        search_bg_color: colors.get(8).cloned().unwrap(),
+		        visual_mode_color: colors.get(5).cloned().unwrap(),
+		        selection_color: colors.get(5).cloned().unwrap(),
+		        hl_line_color: colors.get(8).cloned().unwrap(),
+		        use_color: colors.get(12).cloned().unwrap(),
+		        string_color: colors.get(10).cloned().unwrap(),
             }
-	}
+	    }
 
-	fn fallback() -> Self {
+	    fn fallback() -> Self {
             Theme {
-		background_color: hex_to_rgb("#090909").unwrap(),
-		text_color: hex_to_rgb("#9995BF").unwrap(),
-		normal_cursor_color: hex_to_rgb("#658B5F").unwrap(),
-		insert_cursor_color: hex_to_rgb("#514B8E").unwrap(),
-		fringe_color: hex_to_rgb("#090909").unwrap(),
-		line_numbers_color: hex_to_rgb("#171717").unwrap(),
-		current_line_number_color: hex_to_rgb("#C0ACD1").unwrap(),
-		modeline_color: hex_to_rgb("#060606").unwrap(),
-		modeline_lighter_color: hex_to_rgb("#171717").unwrap(),
-		minibuffer_color: hex_to_rgb("#070707").unwrap(),
-		dired_mode_color: hex_to_rgb("#565663").unwrap(),
-		dired_timestamp_color: hex_to_rgb("#514B8E").unwrap(),
-		dired_path_color: hex_to_rgb("#658B5F").unwrap(),
-		dired_size_color: hex_to_rgb("#48534A").unwrap(),
-		dired_dir_color: hex_to_rgb("#514B8E").unwrap(),
-		comment_color: hex_to_rgb("#867892").unwrap(),
-		warning_color: hex_to_rgb("#565663").unwrap(),
-		error_color: hex_to_rgb("#444E46").unwrap(),
-		ok_color: hex_to_rgb("#4C6750").unwrap(),
-		search_bg_color: hex_to_rgb("#3B5238").unwrap(),
-		visual_mode_color: hex_to_rgb("#3B5238").unwrap(),
-		selection_color: hex_to_rgb("#262626").unwrap(),
-		hl_line_color: hex_to_rgb("#070707").unwrap(),
-		use_color: hex_to_rgb("#514B8E").unwrap(),
-		string_color: hex_to_rgb("#658B5F").unwrap(),
+		        background_color: hex_to_rgb("#090909").unwrap(),
+		        text_color: hex_to_rgb("#9995BF").unwrap(),
+		        normal_cursor_color: hex_to_rgb("#658B5F").unwrap(),
+		        insert_cursor_color: hex_to_rgb("#514B8E").unwrap(),
+		        fringe_color: hex_to_rgb("#090909").unwrap(),
+		        line_numbers_color: hex_to_rgb("#171717").unwrap(),
+		        current_line_number_color: hex_to_rgb("#C0ACD1").unwrap(),
+		        modeline_color: hex_to_rgb("#060606").unwrap(),
+		        modeline_lighter_color: hex_to_rgb("#171717").unwrap(),
+		        minibuffer_color: hex_to_rgb("#070707").unwrap(),
+		        dired_mode_color: hex_to_rgb("#565663").unwrap(),
+		        dired_timestamp_color: hex_to_rgb("#514B8E").unwrap(),
+		        dired_path_color: hex_to_rgb("#658B5F").unwrap(),
+		        dired_size_color: hex_to_rgb("#48534A").unwrap(),
+		        dired_dir_color: hex_to_rgb("#514B8E").unwrap(),
+		        comment_color: hex_to_rgb("#867892").unwrap(),
+		        warning_color: hex_to_rgb("#565663").unwrap(),
+		        error_color: hex_to_rgb("#444E46").unwrap(),
+		        ok_color: hex_to_rgb("#4C6750").unwrap(),
+		        search_bg_color: hex_to_rgb("#3B5238").unwrap(),
+		        visual_mode_color: hex_to_rgb("#3B5238").unwrap(),
+		        selection_color: hex_to_rgb("#262626").unwrap(),
+		        hl_line_color: hex_to_rgb("#070707").unwrap(),
+		        use_color: hex_to_rgb("#514B8E").unwrap(),
+		        string_color: hex_to_rgb("#658B5F").unwrap(),
             }
-	}
+	    }
 
-	fn apply_cursor_color(
+	    fn apply_cursor_color(
             &self,
             cursor_pos: (u16, u16),
             buffer: &Vec<Vec<char>>,
             mode: &Mode,
             minibuffer_active: bool,
             fzy_active: bool,)
-	{
+	    {
             let is_over_text = if let Mode::Normal = mode {
-		buffer.get(cursor_pos.1 as usize)
+		        buffer.get(cursor_pos.1 as usize)
                     .and_then(|line| line.get(cursor_pos.0 as usize))
                     .map(|&c| c != ' ') // Check if the character is not a space
                     .unwrap_or(false)
             } else {
-		false
+		        false
             };
 
             let color = if is_over_text && !minibuffer_active && !fzy_active {
-		&self.text_color
+		        &self.text_color
             } else {
-		match mode {
+		        match mode {
                     Mode::Normal => &self.normal_cursor_color,
                     Mode::Insert => &self.insert_cursor_color,
                     Mode::Dired  => &self.normal_cursor_color,
@@ -4212,21 +4441,21 @@ impl Editor {
                     Mode::Git    => &self.normal_cursor_color,
                     Mode::Yay    => &self.normal_cursor_color,
                     Mode::Emacs  => &self.normal_cursor_color,
-		}
+		        }
             };
 
             // Convert the Color::Rgb to an ANSI escape sequence
             match color {
-		Color::Rgb { r, g, b } => {
+		        Color::Rgb { r, g, b } => {
                     // Construct the ANSI escape code for RGB color setting
                     let ansi_color = format!("\x1b]12;rgb:{:02x}/{:02x}/{:02x}\x1b\\", r, g, b);
                     print!("{}", ansi_color);
-		},
-		_ => {} // Handle other color types
+		        },
+		        _ => {} // Handle other color types
             }
 
             io::stdout().flush().unwrap();
-	}
+	    }
     }
 
 
@@ -4234,87 +4463,87 @@ impl Editor {
     use directories::BaseDirs;
     
     fn get_config_path() -> Option<PathBuf> {
-	if let Some(base_dirs) = BaseDirs::new() {
+	    if let Some(base_dirs) = BaseDirs::new() {
             let config_dir = base_dirs.home_dir().join(".config/redit/config.lua");
             if config_dir.exists() {
-		return Some(config_dir);
+		        return Some(config_dir);
             }
-	}
-	None
+	    }
+	    None
     }
 
     fn load_wal_colors() -> io::Result<Vec<Color>> {
-	if let Some(base_dirs) = directories::BaseDirs::new() {
+	    if let Some(base_dirs) = directories::BaseDirs::new() {
             let wal_colors_path = base_dirs.home_dir().join(".cache/wal/colors");
             if wal_colors_path.exists() {
-		let content = fs::read_to_string(wal_colors_path)?;
-		let colors = content.lines()
+		        let content = fs::read_to_string(wal_colors_path)?;
+		        let colors = content.lines()
                     .map(|line| hex_to_rgb(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)))
                     .collect::<io::Result<Vec<Color>>>();
-		return colors;
+		        return colors;
             }
-	}
-	Err(io::Error::new(io::ErrorKind::NotFound, "WAL colors file not found"))
+	    }
+	    Err(io::Error::new(io::ErrorKind::NotFound, "WAL colors file not found"))
     }
 
 
     fn main() -> Result<()> {
-	let args: Vec<String> = env::args().collect();
+	    let args: Vec<String> = env::args().collect();
 
-	let config_path = get_config_path().map(|path| path.to_str().unwrap().to_string());
-	let mut editor = Editor::new(config_path.as_deref()).expect("Failed to create editor");
+	    let config_path = get_config_path().map(|path| path.to_str().unwrap().to_string());
+	    let mut editor = Editor::new(config_path.as_deref()).expect("Failed to create editor");
 
-	if args.len() > 1 {
+	    if args.len() > 1 {
             let file_path = PathBuf::from(&args[1]);
             editor.open(&file_path, None)?;
-	}
+	    }
 
-	editor.run()
+	    editor.run()
     }
 
     fn hex_to_rgb(hex: &str) -> std::result::Result<Color, &'static str> {
-	if hex.starts_with('#') && hex.len() == 7 {
+	    if hex.starts_with('#') && hex.len() == 7 {
             let r = u8::from_str_radix(&hex[1..3], 16).map_err(|_| "Invalid hex format")?;
             let g = u8::from_str_radix(&hex[3..5], 16).map_err(|_| "Invalid hex format")?;
             let b = u8::from_str_radix(&hex[5..7], 16).map_err(|_| "Invalid hex format")?;
             Ok(Color::Rgb { r, g, b })
-	} else {
+	    } else {
             Err("Invalid hex format")
-	}
+	    }
     }
 
     macro_rules! register_command {
-	($commands:expr, $name:expr, $func:expr) => {
+	    ($commands:expr, $name:expr, $func:expr) => {
             $commands.insert(
-		$name.to_string(),
-		Box::new(move |editor: &mut Editor| {
+		        $name.to_string(),
+		        Box::new(move |editor: &mut Editor| {
                     // Call the function, and wrap non-Result returning functions with Ok(())
                     $func(editor);
                     Ok(())
-		}) as Box<dyn FnMut(&mut Editor) -> io::Result<()>>
+		        }) as Box<dyn FnMut(&mut Editor) -> io::Result<()>>
             );
-	};
+	    };
     }
 
     // TODO Command filterning, Fuzzy matching highlight, Change colors on selction
     struct Fzy {
-	active: bool,
-	items: Vec<String>,
-	input: String,
-	selection_index: usize,
-	max_visible_lines: usize,
-	current_path: PathBuf,
-	initial_input_line_y: Option<u16>,
-	initial_items_start_y: Option<u16>,
-	initial_positioning_done: bool,
-	m_x_active: bool,
-	commands: HashMap<String, Box<dyn FnMut(&mut Editor) -> io::Result<()>>>,
+	    active: bool,
+	    items: Vec<String>,
+	    input: String,
+	    selection_index: usize,
+	    max_visible_lines: usize,
+	    current_path: PathBuf,
+	    initial_input_line_y: Option<u16>,
+	    initial_items_start_y: Option<u16>,
+	    initial_positioning_done: bool,
+	    m_x_active: bool,
+	    commands: HashMap<String, Box<dyn FnMut(&mut Editor) -> io::Result<()>>>,
     }
 
     // TODO IMPORTANT automatcally add all the functions from rust at compile time
     // and all the functions from lua at runtime
     impl Fzy {
-	fn new(current_path: PathBuf) -> Self {
+	    fn new(current_path: PathBuf) -> Self {
             let mut commands: HashMap<String, Box<dyn FnMut(&mut Editor) -> io::Result<()>>> = HashMap::new();
             register_command!(commands, "dired-jump",  Editor::dired_jump);
             register_command!(commands, "eval-buffer", Editor::eval_buffer);
@@ -4324,268 +4553,268 @@ impl Editor {
             register_command!(commands, "eval_region", Editor::eval_region);
             register_command!(commands, "eval_line",   Editor::eval_line);
             Fzy {
-		active: false,
-		items: Vec::new(),
-		input: String::new(),
-		selection_index: 0,
-		max_visible_lines: 11,
-		current_path,
-		initial_input_line_y: None,
-		initial_items_start_y: None,
-		initial_positioning_done: false,
-		m_x_active: false,
-		commands,
+		        active: false,
+		        items: Vec::new(),
+		        input: String::new(),
+		        selection_index: 0,
+		        max_visible_lines: 11,
+		        current_path,
+		        initial_input_line_y: None,
+		        initial_items_start_y: None,
+		        initial_positioning_done: false,
+		        m_x_active: false,
+		        commands,
             }
-	}
+	    }
 
-	fn update_items(&mut self) {
+	    fn update_items(&mut self) {
             // Clear existing items to prepare for new items
             self.items.clear();
 
             if self.m_x_active {
-		self.items.extend(self.commands.keys().cloned());
+		        self.items.extend(self.commands.keys().cloned());
             } else {
-		let mut entries = vec![".".to_string(), "..".to_string()];
-		let dir_entries = std::fs::read_dir(&self.current_path)
+		        let mut entries = vec![".".to_string(), "..".to_string()];
+		        let dir_entries = std::fs::read_dir(&self.current_path)
                     .unwrap()
                     .filter_map(|entry| {
-			let entry = entry.ok()?;
-			let path = entry.path();
-			let file_name = path.file_name()?.to_str()?.to_owned();
+			            let entry = entry.ok()?;
+			            let path = entry.path();
+			            let file_name = path.file_name()?.to_str()?.to_owned();
 
-			// Skip '.' and '..' as they are already added.
-			if file_name == "." || file_name == ".." {
+			            // Skip '.' and '..' as they are already added.
+			            if file_name == "." || file_name == ".." {
                             return None;
-			}
+			            }
 
-			// Add file if it matches the input filter.
-			if self.input.is_empty() || file_name.contains(&self.input) {
+			            // Add file if it matches the input filter.
+			            if self.input.is_empty() || file_name.contains(&self.input) {
                             Some(file_name)
-			} else {
+			            } else {
                             None
-			}
+			            }
                     })
                     .collect::<Vec<String>>();
 
-		entries.extend(dir_entries);
+		        entries.extend(dir_entries);
 
-		if !self.input.is_empty() {
+		        if !self.input.is_empty() {
                     entries.retain(|entry| entry.contains(&self.input));
-		}
+		        }
 
-		self.items = entries;
+		        self.items = entries;
             }
 
             self.selection_index = 0; // Reset selection index on each update
-	}
+	    }
 
-	pub fn calculate_minibuffer_height(&self, max_height: usize) -> usize {
+	    pub fn calculate_minibuffer_height(&self, max_height: usize) -> usize {
             let total_items = self.items.len();
             let visible_items = total_items.min(self.max_visible_lines) + 1; // +1 for the input line
             visible_items.min(max_height + 1) // Ensure it does not exceed max_height
-	}
+	    }
 
 
-	// TODO prefix, path, scroll, end scroll
-	fn draw(&mut self, stdout: &mut Stdout, theme: &Theme) -> io::Result<()> {
+	    // TODO prefix, path, scroll, end scroll
+	    fn draw(&mut self, stdout: &mut Stdout, theme: &Theme) -> io::Result<()> {
             let (width, height) = terminal::size()?;
 
             if !self.initial_positioning_done {
-		let items_to_display = self.items.len().min(self.max_visible_lines);
-		self.initial_input_line_y = Some(height.saturating_sub(items_to_display as u16 + 1));
-		self.initial_items_start_y = Some(self.initial_input_line_y.unwrap().saturating_add(1));
-		self.initial_positioning_done = true;
+		        let items_to_display = self.items.len().min(self.max_visible_lines);
+		        self.initial_input_line_y = Some(height.saturating_sub(items_to_display as u16 + 1));
+		        self.initial_items_start_y = Some(self.initial_input_line_y.unwrap().saturating_add(1));
+		        self.initial_positioning_done = true;
             }
 
             let input_line_y = self.initial_input_line_y.unwrap_or(height.saturating_sub(self.max_visible_lines as u16 + 1));
             let items_start_y = self.initial_items_start_y.unwrap_or(input_line_y.saturating_add(1));
 
             execute!(
-		stdout,
-		MoveTo(1, input_line_y),
-		SetForegroundColor(theme.normal_cursor_color),
-		Print(format!(" {:}/{:<2} ", self.selection_index + 1, self.items.len())),
-		Print("Find file: "),
-		SetForegroundColor(theme.text_color),
-		Print(&self.input)
+		        stdout,
+		        MoveTo(1, input_line_y),
+		        SetForegroundColor(theme.normal_cursor_color),
+		        Print(format!(" {:}/{:<2} ", self.selection_index + 1, self.items.len())),
+		        Print("Find file: "),
+		        SetForegroundColor(theme.text_color),
+		        Print(&self.input)
             )?;
 
             for (index, item) in self.items.iter().enumerate() {
-		let y_pos = items_start_y + index as u16;
-		if y_pos >= height { break; }
+		        let y_pos = items_start_y + index as u16;
+		        if y_pos >= height { break; }
 
-		let is_dir = item == "." || item == ".." || self.current_path.join(item).is_dir();
-		let formatted_item = if is_dir { format!("{}/", item) } else { item.clone() };
+		        let is_dir = item == "." || item == ".." || self.current_path.join(item).is_dir();
+		        let formatted_item = if is_dir { format!("{}/", item) } else { item.clone() };
 
-		let (icon, icon_color) = if self.m_x_active {
+		        let (icon, icon_color) = if self.m_x_active {
                     ("", theme.text_color)
-		} else {
+		        } else {
                     match item.as_str() {
-			".." => ("󱚁", theme.text_color),
-			"." => ("󰉋", theme.text_color),
-			".git" => ("", theme.text_color),
-			_ if item.ends_with(".rs") => ("", hex_to_rgb("#DEA584").unwrap()),
-			_ if item.ends_with(".lua") => ("", theme.normal_cursor_color),
-			_ if item.ends_with(".org") => ("", hex_to_rgb("#77AA99").unwrap()),
-			_ if item.ends_with(".lock") => ("󰌾", theme.text_color), 
-			_ if item.ends_with(".toml") => ("", theme.text_color),
-			_ if item.ends_with(".json") => ("", hex_to_rgb("#CBCB41").unwrap()),
-			_ => ("󰈚", theme.text_color), // Default icon for files
+			            ".." => ("󱚁", theme.text_color),
+			            "." => ("󰉋", theme.text_color),
+			            ".git" => ("", theme.text_color),
+			            _ if item.ends_with(".rs") => ("", hex_to_rgb("#DEA584").unwrap()),
+			            _ if item.ends_with(".lua") => ("", theme.normal_cursor_color),
+			            _ if item.ends_with(".org") => ("", hex_to_rgb("#77AA99").unwrap()),
+			            _ if item.ends_with(".lock") => ("󰌾", theme.text_color), 
+			            _ if item.ends_with(".toml") => ("", theme.text_color),
+			            _ if item.ends_with(".json") => ("", hex_to_rgb("#CBCB41").unwrap()),
+			            _ => ("󰈚", theme.text_color), // Default icon for files
                     }
-		};
+		        };
 
-		if index == self.selection_index {
+		        if index == self.selection_index {
                     execute!(
-			stdout,
-			MoveTo(0, y_pos),
-			SetBackgroundColor(theme.normal_cursor_color),
-			Print(" ".repeat(width as usize)),
+			            stdout,
+			            MoveTo(0, y_pos),
+			            SetBackgroundColor(theme.normal_cursor_color),
+			            Print(" ".repeat(width as usize)),
                     )?;
-		}
+		        }
 
-		execute!(
+		        execute!(
                     stdout,
                     MoveTo(1, y_pos),
                     SetForegroundColor(icon_color),
                     Print(format!("{} ", icon)),
-		)?;
+		        )?;
 
-		let item_color = if is_dir { theme.dired_dir_color } else { theme.text_color };
-		execute!(
+		        let item_color = if is_dir { theme.dired_dir_color } else { theme.text_color };
+		        execute!(
                     stdout,
                     SetForegroundColor(item_color),
                     Print(format!(" {}", formatted_item)),
                     SetBackgroundColor(theme.minibuffer_color)
-		)?;
+		        )?;
             }
 
             execute!(stdout, MoveTo(0, height - 1))?;
             Ok(())
-	}
+	    }
 
-	fn recalculate_positions(&mut self) {
+	    fn recalculate_positions(&mut self) {
             let items_to_display = self.items.len().min(self.max_visible_lines);
             self.initial_input_line_y = Some(terminal::size().unwrap().1.saturating_sub(items_to_display as u16 + 1));
             self.initial_items_start_y = Some(self.initial_input_line_y.unwrap().saturating_add(1));
-	}
+	    }
 
-	
-	pub fn handle_input(&mut self, key: KeyEvent, editor: &mut Editor) -> bool {
+	    
+	    pub fn handle_input(&mut self, key: KeyEvent, editor: &mut Editor) -> bool {
             let mut state_changed = false;
 
             match key {
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('n'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     if self.selection_index < self.items.len() - 1 { 
-			self.selection_index += 1;
+			            self.selection_index += 1;
                     }
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('p'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     if self.selection_index > 0 {
-			self.selection_index -= 1;
+			            self.selection_index -= 1;
                     }
-		},
-		KeyEvent {
+		        },
+		        KeyEvent {
                     code: KeyCode::Char('j'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     if self.selection_index < self.items.len() - 1 { 
-			self.selection_index += 1;
+			            self.selection_index += 1;
                     }
-		},
+		        },
 
-		KeyEvent {
+		        KeyEvent {
                     code: KeyCode::Char('k'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     if self.selection_index > 0 {
-			self.selection_index -= 1;
+			            self.selection_index -= 1;
                     }
-		},
+		        },
                 KeyEvent {
                     code: KeyCode::Char('g'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
-		} => {
+		        } => {
                     self.m_x_active = false;
-		    self.active = false;
-		    self.input.clear();
-		    self.items.clear();
-		    state_changed = true; // Indicate that the fuzzy finder was deactivated
-		},
-		KeyEvent {
+		            self.active = false;
+		            self.input.clear();
+		            self.items.clear();
+		            state_changed = true; // Indicate that the fuzzy finder was deactivated
+		        },
+		        KeyEvent {
                     code,
                     modifiers: KeyModifiers::NONE,
                     ..
-		} => match code {
+		        } => match code {
                     KeyCode::Char(c) => {
-			self.input.push(c);
-			self.update_items();
+			            self.input.push(c);
+			            self.update_items();
                     },
                     KeyCode::Backspace => {
-			self.input.pop();
-			self.update_items();
+			            self.input.pop();
+			            self.update_items();
                     },
                     KeyCode::Up => {
-			if self.selection_index > 0 {
+			            if self.selection_index > 0 {
                             self.selection_index -= 1;
-			}
+			            }
                     },
                     KeyCode::Down => {
-			if self.selection_index < self.items.len() - 1 {
+			            if self.selection_index < self.items.len() - 1 {
                             self.selection_index += 1;
-			}
+			            }
                     },
                     KeyCode::Esc => {
-			self.m_x_active = false;
-			self.active = false;
-			self.input.clear();
-			self.items.clear();
-			state_changed = true; // Indicate that the fuzzy finder was deactivated
+			            self.m_x_active = false;
+			            self.active = false;
+			            self.input.clear();
+			            self.items.clear();
+			            state_changed = true; // Indicate that the fuzzy finder was deactivated
                     },
                     KeyCode::Enter => {
-			if let Some(item) = self.items.get(self.selection_index) {
+			            if let Some(item) = self.items.get(self.selection_index) {
                             if self.m_x_active {
-				// Check if the selected item is a command
-				if let Some(command) = self.commands.get_mut(item) {
+				                // Check if the selected item is a command
+				                if let Some(command) = self.commands.get_mut(item) {
                                     // Execute the command
                                     let result = command(editor);
                                     if let Err(e) = result {
-					// TODO message handle the error
+					                    // TODO message handle the error
                                     }
-				}
-				self.m_x_active = false; // Reset command mode
+				                }
+				                self.m_x_active = false; // Reset command mode
                             } else {
-				// File selection logic
-				let full_path = self.current_path.join(item);
-				if let Err(e) = editor.open(&full_path, None) {
+				                // File selection logic
+				                let full_path = self.current_path.join(item);
+				                if let Err(e) = editor.open(&full_path, None) {
                                     // Handle potential error from opening a file
                                     println!("Error opening file: {}", e);
-				}
+				                }
                             }
                             // Reset Fzy state
                             self.active = false;
                             self.input.clear();
                             self.items.clear();
                             state_changed = true;
-			}
+			            }
                     }
                     _ => {}
-		},
-		_ => {}
+		        },
+		        _ => {}
             }
 
             state_changed // Return whether the fuzzy finder's state has changed
-	}
+	    }
     }
 
 
