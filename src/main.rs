@@ -35,6 +35,7 @@ use regex::Regex;
 // extern crate tree_sitter;
 // extern crate tree_sitter_rust;
 
+
 #[derive(PartialEq)]
 enum Mode {
     Normal,
@@ -1166,6 +1167,132 @@ impl Editor {
         }
     }
 
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+
+    fn scan_words(&self, start: (u16, u16), direction: i32) -> (u16, u16) {
+        let (mut x, mut y) = start;
+        let buffer_len = self.buffer.len() as u16;
+        if direction > 0 {
+            // Moving forward
+            while y < buffer_len {
+                let line = &self.buffer[y as usize];
+                let line_len = line.len() as u16;
+
+                // Skip non-word characters
+                while x < line_len && !Self::is_word_char(line[x as usize]) {
+                    x += 1;
+                }
+
+                // Check if we are still not at the end of the line
+                // If so, move to the end of the next word
+                if x < line_len {
+                    while x < line_len && Self::is_word_char(line[x as usize]) {
+                        x += 1;
+                    }
+                    return (x, y);
+                } 
+
+                // Move to the next line if at the end of the current line
+                y += 1;
+                x = 0;
+            }
+        } else {
+            // Moving backward
+            while y as i32 >= 0 {
+                if x == 0 {
+                    // if line start and not first line
+                    if y > 0 {
+                        y -= 1;
+                        x = self.buffer[y as usize].len() as u16;
+                    } else {
+                        return (0, 0);
+                    }
+                }
+                let line = &self.buffer[y as usize];
+                // Skip non-word characters
+                while x > 0 && !Self::is_word_char(line[(x-1) as usize]) {
+                    x -= 1;
+                }
+
+                // Check if we have reached start of the line
+                // If so, move to the previous line
+                if x == 0 {
+                    if y > 0 {
+                        y -= 1;
+                        x = self.buffer[y as usize].len() as u16;
+                        continue;
+                    } else {
+                        return (0, 0);
+                    }
+                } 
+
+                // If we are still not at the start of the line
+                // Move to the start of the previous word
+                if Self::is_word_char(line[(x-1) as usize]) {
+                    while x > 0 && Self::is_word_char(line[(x-1) as usize]) {
+                        x -= 1;
+                    }
+                    return (x, y);
+                }
+            }
+        }
+
+        (x, y)
+    }
+
+    fn forward_word(&mut self) {
+        self.cursor_pos = self.scan_words(self.cursor_pos, 1);
+    }
+
+    fn backward_word(&mut self) {
+        self.cursor_pos = self.scan_words(self.cursor_pos, -1);
+    }
+
+
+
+
+    fn forward_sentence(&mut self) {
+        let sentence_end_chars = vec!['.', '!', '?'];
+        // iterate over lines in buffer after the current position
+        for (i, line) in self.buffer[self.cursor_pos.1 as usize..].iter().enumerate() {
+            let y = (self.cursor_pos.1 + i as u16) as usize;
+            let start_x = if y == self.cursor_pos.1 as usize { self.cursor_pos.0 as usize } else { 0 };
+            // iterate over chars in line after the current position
+            for (j, c) in line[start_x..].iter().enumerate() {
+                let x = (start_x + j) as u16;
+                // check if character is a sentence ending to move cursor position
+                if sentence_end_chars.contains(c) {
+                    self.cursor_pos = (x + 1, y as u16); // move one forward after the sentence end
+                    return;
+                }
+            }
+        }
+    }
+
+    fn backward_sentence(&mut self) {
+        let sentence_end_chars = vec!['.', '!', '?'];
+        // iterate backward over lines in buffer before the current position
+        for (i, line) in self.buffer[..=self.cursor_pos.1 as usize].iter().enumerate().rev() {
+            let y = i as u16;
+            let end_x = if y == self.cursor_pos.1 { self.cursor_pos.0 as usize } else { line.len() };
+            if end_x > 0 { // check if there's anything to scan in this line
+                // iterate backward over chars in line within the scan range
+                for (j, c) in line[..end_x].iter().enumerate().rev() {
+                    let x = j as u16;
+                    // check if character is a sentence ending to move cursor position
+                    if sentence_end_chars.contains(c) {
+                        self.cursor_pos = (x + 1, y); // move one forward after the sentence end
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+
 
     fn recenter_top_bottom(&mut self) {
         let (_, height) = terminal::size().unwrap();
@@ -2134,7 +2261,7 @@ impl Editor {
             Ok(())
         }
 
-        // TODO rainbow_delimiters_mode
+        // // TODO rainbow_delimiters_mode
         fn draw_text(&self, stdout: &mut Stdout) -> io::Result<()> {
             let (width, height) = terminal::size()?;
 	        let default_text_color = self.current_theme().text_color;
@@ -2230,7 +2357,6 @@ impl Editor {
 	        Ok(())
 	    }
 
-
 	    // // ORIGINAL
 	    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
 	    //     let (width, height) = terminal::size()?;
@@ -2274,7 +2400,7 @@ impl Editor {
 	    // }
 
 
-	    // // Still flicker (syntax highlight)
+	    // // // // Still flicker (syntax highlight)
 	    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
 	    //     let (width, height) = crossterm::terminal::size()?;
 	    //     let text_color = self.current_theme().text_color;
@@ -3725,6 +3851,12 @@ impl Editor {
                     modifiers: KeyModifiers::NONE,
                     ..
 		        } => match code {
+                    KeyCode::Char('b') => {
+                        self.backward_word();
+                    },
+                    KeyCode::Char('w') => {
+                        self.forward_word();
+                    },
                     KeyCode::Backspace => {
 			            self.backspace();
 			            self.snapshot();
@@ -3967,7 +4099,8 @@ impl Editor {
 
         fn handle_emacs_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key {
-
+                
+                // FIXME WHY IT DOESN'T WORK :(
                 KeyEvent {
                     code: KeyCode::Char('/'),
                     modifiers: KeyModifiers::CONTROL,
@@ -4070,6 +4203,25 @@ impl Editor {
                 } => {
                     self.mwim_end();
                 },
+
+                KeyEvent {
+                    code: KeyCode::Char('a'),
+                    modifiers: KeyModifiers::ALT,
+                    ..
+                } => {
+                    self.backward_sentence();
+                },
+                KeyEvent {
+                    code: KeyCode::Char('e'),
+                    modifiers: KeyModifiers::ALT,
+                    ..
+                } => {
+                    self.forward_sentence();
+                },
+
+
+
+
                 KeyEvent {
                     code: KeyCode::Char('y'),
                     modifiers: KeyModifiers::CONTROL,
@@ -4117,12 +4269,28 @@ impl Editor {
                     self.left();
                 },
                 KeyEvent {
+                    code: KeyCode::Char('b'),
+                    modifiers: KeyModifiers::ALT,
+                    ..
+                } => {
+                    self.backward_word();
+                },
+                KeyEvent {
                     code: KeyCode::Char('f'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 } => {
                     self.right();
                 },
+
+                KeyEvent {
+                    code: KeyCode::Char('f'),
+                    modifiers: KeyModifiers::ALT,
+                    ..
+                } => {
+                    self.forward_word();
+                },
+
 
                 KeyEvent {
                     code,

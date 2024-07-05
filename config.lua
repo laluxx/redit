@@ -21,6 +21,7 @@ Compile_command = "cargo build"
 Max_minibuffer_height = 30
 Emacs_scrolling = true
 
+
 -- TODO message in lua
 -- TODO error in lua and rust
 

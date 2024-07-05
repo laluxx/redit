@@ -1,8 +1,13 @@
 * Editor
 
+IMPORTANT [ ] A system that tracks and center the cursor
+instead of hardcoding the follow cursor ability in each function that could move the cursor
+
+TODO [ ] The scrollbar should automatically disappear when not scrolling for (config) seconds
+
+
 Highlight TODO BUG NOTE FIXME just the text, if its like this NOTE: also the bg
 copying should copy to the actual system clipboard too []
-Emacs mode []
 Ability to open the message buffer []
 Make search case insensitive [] (config)
 Can't insert capital letters in fzy but works in the minibuffer []
