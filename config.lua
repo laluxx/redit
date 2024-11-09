@@ -1,7 +1,7 @@
 -- config.lua
 Blink_cursor = true
 Show_fringe = false
-Show_line_numbers = true
+Show_line_numbers = false
 Insert_line_cursor = false
 Show_hl_line = false
 Top_scroll_margin = 10
@@ -9,8 +9,8 @@ Bottom_scroll_margin = 10
 Blink_limit = 10
 Indentation = 4
 Electric_pair_mode = true
-Tree_node = "◯" -- □
-Current_tree_node = "●" -- ■
+Tree_node = "◯"
+Current_tree_node = "●"
 Tree_node_separator = "—"
 Modeline_separator_right = ""
 Modeline_separator_left = "◖" --
@@ -19,7 +19,7 @@ Rainbow_mode = true
 Scroll_bar_mode = true
 Compile_command = "cargo build"
 Max_minibuffer_height = 30
-Emacs_scrolling = true
+Emacs_scrolling = false
 
 
 -- TODO message in lua
@@ -39,7 +39,7 @@ function a()
 end
 
 
-Theme = "dark" -- WAL
+Theme = "badger" -- WAL
 -- Here you can define your hown themes
 -- TODO if a theme field is missing it crash
 Themes = {
@@ -97,32 +97,32 @@ Themes = {
       use_color = "#4d9391",
       string_color = "#7CF083",
    },
-   nature = {
-      background_color = "#090909",
-      text_color = "#9995BF",
-      normal_cursor_color = "#658B5F",
-      insert_cursor_color = "#514B8E",
-      fringe_color = "#090909",
-      line_numbers_color = "#171717",
-      current_line_number_color = "#C0ACD1",
-      modeline_color = "#060606",
-      modeline_lighter_color = "#171717",
-      minibuffer_color = "#070707",
-      dired_mode_color = "#565663",
-      dired_timestamp_color = "#514B8E",
-      dired_path_color = "#658B5F",
-      dired_size_color = "#48534A",
-      dired_dir_color = "#514B8E",
-      comment_color = "#867892",
-      warning_color = "#565663",
-      error_color = "#444E46",
-      ok_color = "#4C6750",
-      search_bg_color = "#3B5238",
-      visual_mode_color = "#3B5238",
-      selection_color = "#262626",
-      hl_line_color = "#070707",
-      use_color = "#514B8E",
-      string_color = "#9ECE6A",
+   badger = {
+      background_color = "#171717",
+      text_color = "#F6F3E8",
+      normal_cursor_color = "#8AC6F2",
+      insert_cursor_color = "#BF93C3",
+      fringe_color = "#171717",
+      line_numbers_color = "#656868",
+      current_line_number_color = "#F6F3E8",
+      modeline_color = "#272727",
+      modeline_lighter_color = "#2A2A2A",
+      minibuffer_color = "#171717",
+      dired_mode_color = "#86B187",
+      dired_timestamp_color = "#BF93C3",
+      dired_path_color = "#8AC6F2",
+      dired_size_color = "#EA9847",
+      dired_dir_color = "#8AC6F2",
+      comment_color = "#656868",
+      warning_color = "#E0D063",
+      error_color = "#E2434C",
+      ok_color = "#86B187",
+      search_bg_color = "#608AA9",
+      visual_mode_color = "#E18CBB",
+      selection_color = "#434343",
+      hl_line_color = "#2F2F2F",
+      use_color = "#8AC6F2",
+      string_color = "#86B187",
    },
    tokyonight = {
       background_color = "#1A1B26",

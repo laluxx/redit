@@ -43,8 +43,6 @@ enum Mode {
     Dired,
     Visual,
     Git,
-    Yay,
-    Emacs,
 }
 
 // (for rainbow mode) TODO MOVEME
@@ -305,7 +303,6 @@ struct Config {
 
 impl Config {
     fn new(lua: &Lua, lua_script_path: Option<&str>) -> LuaResult<Self> {
-
         let defaults = Config {
             blink_cursor: true,
             show_fringe: true,
@@ -660,7 +657,7 @@ impl Editor {
             syntax_highlighter,
             states: vec![initial_undo_state],
             current_state: 0,
-            mode: Mode::Emacs,
+            mode: Mode::Normal,
             cursor_pos: (0, 0),
             minibuffer_cursor_pos: (0, 0),
             offset: (0, 0),
@@ -1993,8 +1990,6 @@ impl Editor {
                     let cursor_line = (dired.cursor_pos + 2).min(height - self.minibuffer_height - 1);
                     (dired.entry_first_char_column, cursor_line)
                 })
-                // } else if self.mode == Mode::Yay {
-                //     (0, 0) // Dummy value, cursor will be hidden
             } else {
                 let mut start_col = 0;
                 if self.config.show_fringe {
@@ -2046,7 +2041,6 @@ impl Editor {
             Ok(())
         }
 
-
         fn draw_scroll_bar(&self, stdout: &mut io::Stdout, width: u16, height: u16) -> io::Result<()> {
             let total_lines = self.buffer.len() as u16;
             let visible_lines = height - self.minibuffer_height - 1; // Exclude minibuffer and modeline
@@ -2076,117 +2070,6 @@ impl Editor {
             Ok(())
         }
 
-
-        fn get_packages() -> Vec<&'static str> {
-            vec![
-                "package1",
-                "package2",
-                "package3",
-                "package4",
-                "package5",
-                "package6",
-                "package7",
-                "package8",
-                "package9",
-                "package10",
-            ]
-        }
-
-        // TODO NEXT hadle more keys and actually fetch the packages based fuzzy matching the content
-        // of the minibuffer if you dont have yay fuck you
-
-        fn draw_yay(&self, stdout: &mut io::Stdout, theme: &Theme) -> io::Result<()> {
-            let (width, height) = terminal::size()?;
-            let background_color = theme.background_color;
-            let text_color = theme.text_color;
-            let selected_color = theme.selection_color;
-            let packages = Self::get_packages(); // Get the package list
-            let bottom_exclude = self.minibuffer_height + 1;
-
-            // Calculate the number of lines that can be displayed
-            let viewable_lines = height - bottom_exclude;
-            let total_packages = packages.len() as u16;
-
-            // Determine the starting index for displaying packages based on cursor position
-            let start_idx = if self.cursor_pos.1 > viewable_lines / 2 {
-                self.cursor_pos.1 - viewable_lines / 2
-            } else {
-                0
-            }.min(total_packages.saturating_sub(viewable_lines));
-
-            // Render each package in the visible range
-            for (idx, package) in packages.iter().enumerate().skip(start_idx as usize).take(viewable_lines as usize) {
-                let y = (idx as u16).saturating_sub(start_idx);
-
-                // Draw full-width background for the selected line
-                if idx as u16 + start_idx == self.cursor_pos.1 {
-                    execute!(
-                        stdout,
-                        MoveTo(0, y),
-                        SetBackgroundColor(selected_color),
-                        Print(" ".repeat(width as usize)),
-                        ResetColor
-                    )?;
-                }
-
-                // Draw the package name
-                execute!(
-                    stdout,
-                    MoveTo(0, y),
-                    SetForegroundColor(text_color),
-                    SetBackgroundColor(if idx as u16 + start_idx == self.cursor_pos.1 { selected_color } else { background_color }),
-                    Print(package),
-                    ResetColor
-                )?;
-            }
-
-            Ok(())
-        }
-
-
-        // fn draw_yay(&self, stdout: &mut io::Stdout, theme: &Theme) -> io::Result<()> {
-        //     let (width, height) = terminal::size()?;
-        //     let background_color = theme.background_color;
-        //     let text_color = theme.text_color;
-        //     let selected_color = theme.selection_color;
-        //     let packages = Self::get_packages(); // Get the package list
-        //     let bottom_exclude = self.minibuffer_height + 1;
-
-        //     // Ensure packages fit within the view
-        //     let viewable_lines = height - bottom_exclude;
-        //     let total_packages = packages.len() as u16;
-        //     let start_idx = self.offset.1.min(total_packages.saturating_sub(viewable_lines));
-
-        //     for (idx, package) in packages.iter().enumerate().skip(start_idx as usize).take(viewable_lines as usize) {
-        //         let y = (idx as u16).saturating_sub(start_idx);
-
-        //         // Draw full-width background for the selected line
-        //         if idx as u16 == self.cursor_pos.1 {
-        //             execute!(
-        //                 stdout,
-        //                 MoveTo(0, y),
-        //                 SetBackgroundColor(selected_color),
-        //                 Print(" ".repeat(width as usize)),
-        //                 ResetColor
-        //             )?;
-        //         }
-
-        //         // Draw the package name
-        //         execute!(
-        //             stdout,
-        //             MoveTo(0, y),
-        //             SetForegroundColor(text_color),
-        //             SetBackgroundColor(if idx as u16 == self.cursor_pos.1 { selected_color } else { background_color }),
-        //             Print(package),
-        //             ResetColor
-        //         )?;
-        //     }
-
-        //     Ok(())
-        // }
-
-
-
         fn draw(&mut self, stdout: &mut Stdout) -> Result<()> {
             let (width, height) = terminal::size()?;
             let background_color = self.current_theme().background_color;
@@ -2201,7 +2084,7 @@ impl Editor {
             
             // Draw text area for non-Dired modes
             // if self.mode != Mode::Dired  {
-            if self.mode != Mode::Dired && self.mode != Mode::Git && self.mode != Mode::Yay {
+            if self.mode != Mode::Dired && self.mode != Mode::Git {
                 let mut start_col = 0;
                 if self.config.show_fringe {
                     self.draw_fringe(stdout, height)?;
@@ -2222,8 +2105,6 @@ impl Editor {
 
             self.draw_modeline(stdout, width, height)?;
 
-
-            
             if let Some(mut fzy) = self.fzy.take() { // Temporarily take `fzy` out of `self`
                 let theme = self.current_theme(); // Now it's safe to borrow `self` immutably
                 if fzy.active {
@@ -2231,9 +2112,6 @@ impl Editor {
                 }
                 self.fzy.replace(fzy); // Put `fzy` back into `self`
             }
-
-
-
 
             if self.mode == Mode::Dired {
                 if let Some(mut dired) = self.dired.take() { // Temporarily take `dired` out of `self`
@@ -2247,21 +2125,14 @@ impl Editor {
                 // self.draw_git(stdout)?;
             }
 
-            if self.mode == Mode::Yay {
-                self.draw_yay(stdout, self.current_theme())?;
-            }
-
-
             // Reset the background color for fringe and line numbers
             execute!(stdout, SetBackgroundColor(background_color))?;
-
-
             
             io::stdout().flush()?;
             Ok(())
         }
 
-        // // TODO rainbow_delimiters_mode
+        // rainbow_delimiters_mode
         fn draw_text(&self, stdout: &mut Stdout) -> io::Result<()> {
             let (width, height) = terminal::size()?;
 	        let default_text_color = self.current_theme().text_color;
@@ -2357,7 +2228,7 @@ impl Editor {
 	        Ok(())
 	    }
 
-	    // // ORIGINAL
+	    // ORIGINAL
 	    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
 	    //     let (width, height) = terminal::size()?;
 	    //     let text_color = self.current_theme().text_color;
@@ -2400,7 +2271,7 @@ impl Editor {
 	    // }
 
 
-	    // // // // Still flicker (syntax highlight)
+	    // Still flicker (syntax highlight)
 	    // fn draw_text(&self, stdout: &mut io::Stdout) -> Result<()> {
 	    //     let (width, height) = crossterm::terminal::size()?;
 	    //     let text_color = self.current_theme().text_color;
@@ -2643,8 +2514,6 @@ impl Editor {
                 Mode::Dired  => ("DIRED",  self.current_theme().dired_mode_color,    Color::Black),
                 Mode::Visual => ("VISUAL", self.current_theme().visual_mode_color,   Color::Black),
                 Mode::Git    => (" GIT",  self.current_theme().visual_mode_color,   Color::Black),
-                Mode::Yay    => (" YAY",  self.current_theme().visual_mode_color,   Color::Black),
-                Mode::Emacs  => (" EMACS",self.current_theme().visual_mode_color,   Color::Black),
             };
 
             let file_bg_color = self.current_theme().modeline_lighter_color;
@@ -2672,10 +2541,6 @@ impl Editor {
             let fill_length_before_pos_str = if self.mode == Mode::Dired {
                 width - (4 + mode_str.len() as u16 + display_str.len() as u16 + pos_str_length + custom_text_length)
             } else if self.mode == Mode::Git {
-                width - (4 + mode_str.len() as u16 + display_str.len() as u16 + pos_str_length + custom_text_length + 1)
-            } else if self.mode == Mode::Yay {
-                width - (4 + mode_str.len() as u16 + display_str.len() as u16 + pos_str_length + custom_text_length + 1)
-            } else if self.mode == Mode::Emacs {
                 width - (4 + mode_str.len() as u16 + display_str.len() as u16 + pos_str_length + custom_text_length + 1)
             } else {
                 width - (4 + mode_str.len() as u16 + display_str.len() as u16 + pos_str_length + custom_text_length + 3)
@@ -2831,7 +2696,7 @@ impl Editor {
                 }
 
                 // Update editor state for the opened file
-                self.mode = Mode::Emacs; 
+                self.mode = Mode::Normal; 
                 self.cursor_pos = (0,0);
                 self.adjust_view_to_cursor("");
                 self.states.clear(); // Clears the undo history
@@ -3416,8 +3281,6 @@ impl Editor {
                     Mode::Dired  => { self.handle_dired_mode(key)?;  },
                     Mode::Visual => { self.handle_visual_mode(key)?; },
                     Mode::Git    => { self.handle_git_mode(key)?;    },
-                    Mode::Yay    => { self.handle_yay_mode(key)?;    },
-                    Mode::Emacs  => { self.handle_emacs_mode(key)?;  },
 		        }
             }
 
@@ -3435,8 +3298,6 @@ impl Editor {
                     | Mode::Dired
                     | Mode::Visual 
                     | Mode::Git
-                    | Mode::Yay
-                    | Mode::Emacs
                     => block,
 		        Mode::Insert => if self.config.insert_line_cursor { line } else { block },
 
@@ -3579,7 +3440,7 @@ impl Editor {
 		        },
 
 		        KeyCode::Char('q') => {
-                    self.mode = Mode::Emacs; // TODO HERE
+                    self.mode = Mode::Normal;
                     // self.message_buffers();
 		        },
 
@@ -3590,14 +3451,6 @@ impl Editor {
 	    
 	    fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
             match key {
-
-                KeyEvent {
-                    code: KeyCode::Char('z'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } => {
-                    self.mode = Mode::Emacs;
-                },
 
 		        KeyEvent {
                     code: KeyCode::Tab,
@@ -3837,14 +3690,6 @@ impl Editor {
 		        } => {
                     self.paste("before");
 		        },
-		        KeyEvent {
-                    code: KeyCode::Char('y'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-		        } => {
-                    self.mode = Mode::Yay;
-		        },
-
 
 		        KeyEvent {
                     code,
@@ -3932,7 +3777,8 @@ impl Editor {
 			            // self.message("--INSERT--"); 
                     },
                     KeyCode::Char('d') => {
-			            self.dired_jump();
+                        self.delete_char();
+			            self.snapshot();
                     },
                     KeyCode::Char(':') => {
 			            self.minibuffer_active = true;
@@ -4020,7 +3866,7 @@ impl Editor {
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 } => {
-                    self.mode = Mode::Emacs;
+                    self.mode = Mode::Normal;
                     self.set_cursor_shape();
                     self.selection_start = None;
                     self.selection_end = None;
@@ -4607,8 +4453,6 @@ impl Editor {
                     Mode::Dired  => &self.normal_cursor_color,
                     Mode::Visual => &self.normal_cursor_color,
                     Mode::Git    => &self.normal_cursor_color,
-                    Mode::Yay    => &self.normal_cursor_color,
-                    Mode::Emacs  => &self.normal_cursor_color,
 		        }
             };
 
@@ -4625,8 +4469,6 @@ impl Editor {
             io::stdout().flush().unwrap();
 	    }
     }
-
-
 
     use directories::BaseDirs;
     
@@ -4984,5 +4826,3 @@ impl Editor {
             state_changed // Return whether the fuzzy finder's state has changed
 	    }
     }
-
-
